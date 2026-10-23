@@ -43,5 +43,17 @@ cargo build --release -p codex-plus-manager --bin codex-plus-plus --locked
 主程序是 `target/release/codex-plus-plus.exe`。退出旧 Codex++ 后运行新程序，
 配置仍沿用本机原目录。官方 Codex 安装包不需要改动。
 
-安装上游官方 Codex++ 更新会替换本地修复版 EXE；在上游合入等价修复前，
-请从本 fork 合并更新并重新编译。不要直接把 GitHub 的“丢弃本地提交”同步操作用于本 fork。
+本 fork 的更新检查与下载使用 `zmsvovo/CodexPlusPlus` 的 Release，
+入口为 `https://github.com/zmsvovo/CodexPlusPlus/releases/latest/download/latest.json`，
+不会回退到上游安装包。关于页的项目链接也指向本 fork。
+
+后续更新流程：合并上游并保留本地修复，推送提交，为该提交创建新的 fork 标签，
+运行 Release assets 工作流（platform=windows、draft=true、publish=true）。
+安装包、ZIP 和 latest.json 齐备后才公开发布；本 fork 不构建需要上游 Apple 凭据的 macOS 包。
+仅推送代码不会产生客户端更新；必须完成 Release 发布。
+版本比较仍沿用上游的数字版本规则，`-fork.1` 等标签后缀不参与比较，
+同一上游版本的补发不会触发升级提示，下一次更高数字版本的 Release 才会提示更新。
+
+首次从旧构建迁移需要手动运行本 fork 的新版 EXE；旧 EXE 内置的上游地址不会自动改变。
+手动安装上游官方包仍会覆盖修复和更新来源。
+不要直接把 GitHub 的“丢弃本地提交”同步操作用于本 fork。

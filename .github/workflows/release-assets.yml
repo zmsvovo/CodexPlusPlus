@@ -135,7 +135,8 @@ jobs:
             dist/windows/*.zip
 
   macos-dmg:
-    if: github.event_name == 'release' || inputs.platform != 'windows'
+    # 本 fork 发布 Windows 包，不依赖上游私有的 Apple 签名凭据。
+    if: github.repository != 'zmsvovo/CodexPlusPlus' && (github.event_name == 'release' || inputs.platform != 'windows')
     # 单个通用包（universal）同时支持 Intel 与 Apple Silicon，
     # 用户不必再自己判断架构，Release 也只多一个而不是两个产物。
     name: macOS DMG (universal)
@@ -313,9 +314,11 @@ jobs:
           const version = tag.replace(/^v/i, "");
           const required = [
             "CodexPlusPlus-" + version + "-windows-x64-setup.exe",
-            "CodexPlusPlus-" + version + "-windows-x64.zip",
-            "CodexPlusPlus-" + version + "-macos-universal.dmg"
+            "CodexPlusPlus-" + version + "-windows-x64.zip"
           ];
+          if (repo !== "zmsvovo/CodexPlusPlus") {
+            required.push("CodexPlusPlus-" + version + "-macos-universal.dmg");
+          }
           for (const name of required) {
             if (!(release.assets || []).some((asset) => asset.name === name && asset.size > 0)) {
               throw new Error("发布附件缺失或为空：" + name);
@@ -346,7 +349,7 @@ jobs:
         run: gh release upload "$TAG" latest.json --clobber --repo "$REPO"
 
       - name: Publish prepared Release
-        if: github.event_name == 'workflow_dispatch' && inputs.draft && inputs.publish && needs.windows-installer.result == 'success' && needs.macos-dmg.result == 'success'
+        if: github.event_name == 'workflow_dispatch' && inputs.draft && inputs.publish && needs.windows-installer.result == 'success' && (needs.macos-dmg.result == 'success' || (github.repository == 'zmsvovo/CodexPlusPlus' && needs.macos-dmg.result == 'skipped'))
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ env.RELEASE_TAG }}
