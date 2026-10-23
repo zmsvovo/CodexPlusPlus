@@ -53,7 +53,7 @@ function environment(patch = true, source = sourceOf(shapes[0].fixtures)) {
   };
   const manager = {
     getHostId: () => state.host,
-    getAccount: async () => { state.accountReads++; return { account: { type: state.accountType } }; },
+    getAccount: async () => { state.accountReads++; return { account: state.accountType == null ? null : { type: state.accountType } }; },
     getConversation: () => null, getConversationCwd: () => "/fixture", needsResume: () => false,
     requestClient: { sendRequest }, logger: { error() {} }, sendRequest,
   };
@@ -176,6 +176,41 @@ async function runShape({ name, fixtures, bedrockNative }) {
   state.override = { type: "custom", serviceTier: "priority" };
   assert.equal(await fns.x$s(env.scope, "local", "model"), "priority");
   state.override = { type: "fromConfig" };
+
+  // 纯自定义供应商没有官方 account：UI、直接请求、默认/显式队列都必须放行。
+  for (const auth of [null, undefined]) {
+    state.auth = auth;
+    state.accountType = auth;
+    api.runtime.configureProvider(true);
+    assert.equal(fns.Mxo().serviceTierAccess.fast, true);
+    assert.equal(await fns.x$s(env.scope, "local", "model", "priority"), "priority");
+    state.accountReads = 0;
+    assert.equal(await env.queue().readServiceTier("model"), "priority");
+    assert.equal(state.accountReads, 1);
+    assert.equal((await env.explicit("priority")).serviceTier, "priority");
+    assert.equal(await fns.x$s(env.scope, "local", "model", "default"), null);
+    assert.equal(await fns.x$s(env.scope, "remote", "model", "priority"), null);
+    assert.equal((await env.explicit("priority", "remote")).serviceTier, null);
+    state.copilotPreferred = state.copilotAvailable = true;
+    assert.equal(await env.queue().readServiceTier("model"), null);
+    assert.equal((await env.explicit("priority")).serviceTier, null);
+    state.copilotPreferred = state.copilotAvailable = false;
+    state.requirements = { requirements: { featureRequirements: { fast_mode: false } } };
+    assert.equal(fns.Mxo().serviceTierAccess.fast, false);
+    assert.equal(await fns.x$s(env.scope, "local", "model", "priority"), null);
+    assert.equal(await env.queue().readServiceTier("model"), null);
+    state.requirements = { requirements: null };
+    api.runtime.update({ ...enabled, codexAppNativeFastUnlock: false });
+    assert.equal(fns.Mxo().serviceTierAccess, null);
+    assert.equal((await env.explicit("priority")).serviceTier, null);
+    api.runtime.update(enabled);
+    api.runtime.configureProvider(false);
+    assert.equal(fns.Mxo().serviceTierAccess, null, "官方未登录或未知供应商不借 null 身份放行");
+    assert.equal(await env.queue().readServiceTier("model"), null);
+    assert.equal((await env.explicit("priority")).serviceTier, null);
+  }
+  state.auth = "apikey";
+  state.accountType = "apiKey";
 
   // 补丁只追加 API key 放行；官方认可的登录方式随 Codex 版本原样保留。
   const officialAuths = ["chatgpt", "personalAccessToken", ...(bedrockNative ? ["amazonBedrock"] : [])];

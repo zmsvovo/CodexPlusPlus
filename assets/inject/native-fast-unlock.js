@@ -10,6 +10,10 @@
   const literal = "`[A-Za-z]\\w*`";
 
   const runtime = {
+    configureProvider(customProviderWithoutAccount) {
+      // 只接收宿主从本机配置解析出的布尔值，不把 URL 或凭据送入 renderer。
+      root.__codexPlusNativeFastCustomProvider = customProviderWithoutAccount === true;
+    },
     update(settings) {
       root.__codexPlusSettings = settings && typeof settings === "object" ? settings : null;
       return runtime.status();
@@ -27,7 +31,8 @@
     },
     allow(hostId, authMethod) {
       return hostId === "local"
-        && (authMethod === "apikey" || authMethod === "apiKey")
+        && (authMethod === "apikey" || authMethod === "apiKey"
+          || authMethod == null && root.__codexPlusNativeFastCustomProvider === true)
         && runtime.status().enabled;
     },
   };
@@ -75,7 +80,7 @@
             `(?<gate>(?<account>\\(await \\k<manager>\\.getAccount\\(\\{priority:${critical}\\}\\)\\)\\.account\\?\\.type)===${chatgpt})\\)\\},async writeServiceTier\\(`,
           ].join(""),
           // includes 只消费一次 account/read；外层 Copilot 分支原样保留。
-          replacement: (groups) => `[${chatgpt},...(${allow(`${groups.manager}.getHostId()`, apiKey)}?[${apiKey}]:[])].includes(${groups.account})`,
+          replacement: (groups) => `[${chatgpt},...(${allow(`${groups.manager}.getHostId()`, apiKey)}?[${apiKey}]:[]),...(${allow(`${groups.manager}.getHostId()`, "null")}?[null,void 0]:[])].includes(${groups.account})`,
         },
         {
           // 26.10 起改成 if/return 语句体，账号结果先落到局部变量再比较。

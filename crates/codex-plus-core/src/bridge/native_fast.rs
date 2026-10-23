@@ -36,6 +36,44 @@ fn bootstrap_script(enhancements_enabled: bool, native_fast_unlock: bool) -> Str
     )
 }
 
+// 自定义供应商可以直接使用 bearer/env/header 认证，此时 account/read 返回 null。
+// 只依据活动供应商配置确认这一分支；官方未登录、未知配置都保持关闭。
+fn custom_provider_without_account(contents: &str) -> bool {
+    let Ok(config) = contents.parse::<toml::Value>() else {
+        return false;
+    };
+    let profile = match config.get("profile").and_then(toml::Value::as_str) {
+        Some(name) => match config.get("profiles").and_then(|p| p.get(name)) {
+            Some(profile) => Some(profile),
+            None => return false,
+        },
+        None => None,
+    };
+    let provider_id = profile
+        .and_then(|p| p.get("model_provider"))
+        .or_else(|| config.get("model_provider"))
+        .and_then(toml::Value::as_str);
+    let Some(provider_id) = provider_id.filter(|id| !id.is_empty() && *id != "openai") else {
+        return false;
+    };
+    let Some(provider) = config
+        .get("model_providers")
+        .and_then(|p| p.get(provider_id))
+    else {
+        return false;
+    };
+    let no_account = match provider.get("requires_openai_auth") {
+        None | Some(toml::Value::Boolean(false)) => true,
+        _ => false,
+    };
+    no_account
+        && provider
+            .get("base_url")
+            .and_then(toml::Value::as_str)
+            .and_then(|value| reqwest::Url::parse(value).ok())
+            .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
 pub(super) async fn install(
     websocket_url: &str,
     generation: BridgeGeneration,
@@ -47,7 +85,14 @@ pub(super) async fn install(
     let socket = connect_cdp_websocket(websocket_url).await?;
     let mut session = CdpSession::new(socket);
     let mut state = InterceptorState::default();
-    let bootstrap = bootstrap_script(true, true);
+    let config =
+        std::fs::read_to_string(crate::relay_config::default_codex_home_dir().join("config.toml"))
+            .unwrap_or_default();
+    let bootstrap = format!(
+        "{}\n;window.__codexPlusNativeFastUnlock.runtime.configureProvider({});",
+        bootstrap_script(true, true),
+        custom_provider_without_account(&config),
+    );
     let initialized = async {
         let location = evaluate(&mut session, "location.protocol").await?;
         if location
@@ -818,6 +863,34 @@ mod tests {
                 .any(|command| command["method"].as_str().unwrap().starts_with("Debugger."))
         );
         commands
+    }
+
+    #[test]
+    fn native_fast_custom_provider_scope() {
+        let custom = "model_provider = 'custom'\n[model_providers.custom]\nbase_url = 'https://example.test/v1'\nexperimental_bearer_token = 'fixture-only'\n";
+        assert!(custom_provider_without_account(custom));
+        assert!(custom_provider_without_account(&format!(
+            "{custom}requires_openai_auth = false\n"
+        )));
+        assert!(!custom_provider_without_account(&format!(
+            "{custom}requires_openai_auth = true\n"
+        )));
+        assert!(!custom_provider_without_account(
+            &custom.replace("custom", "openai")
+        ));
+        assert!(!custom_provider_without_account(
+            "model_provider = 'custom'"
+        ));
+        assert!(!custom_provider_without_account("broken = ["));
+        assert!(!custom_provider_without_account(&format!(
+            "profile = 'missing'\n{custom}"
+        )));
+        assert!(!custom_provider_without_account(&format!(
+            "profile = 'official'\n{custom}[profiles.official]\nmodel_provider = 'openai'\n"
+        )));
+        assert!(custom_provider_without_account(
+            "profile = 'api'\nmodel_provider = 'openai'\n[profiles.api]\nmodel_provider = 'custom'\n[model_providers.custom]\nbase_url = 'https://example.test/v1'\n"
+        ));
     }
 
     #[test]
