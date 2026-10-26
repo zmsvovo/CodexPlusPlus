@@ -1,6 +1,6 @@
 # 自定义供应商空账号的原生 Fast 修复
 
-本 fork 修复 Codex++ 1.11.1 在纯自定义供应商模式下的 Fast 按钮缺失。
+本 fork 修复纯自定义供应商模式下的 Fast 按钮缺失，并适配 Codex 更新后的门控结构。
 使用 `experimental_bearer_token` 等认证配置时，Codex 可以正常请求模型，
 但其 UI 的 `authMethod` 和 `account/read` 的 `account` 可以为 null。
 原补丁只接受 `apikey` / `apiKey`，因此已经声明 priority 的模型仍没有速度选项。
@@ -13,6 +13,18 @@
 - UI、直接请求读取、默认队列、显式队列共用放行条件；旧版队列仍只读取一次账号。
 - 仍要求本地主机、增强总开关及原生 Fast 开关，保留模型档位和 requirements 限制、Standard 和 Copilot 行为。
 - 供应商配置的识别在注入时执行；修改供应商后应通过 Codex++ 重新启动 Codex。
+
+## 1.12.1-fork.1
+
+- 同步 Codex++ 上游 1.12.1，使用上游新增的本机 API 身份投影实现，保留未填写
+  `requires_openai_auth` 的自定义 Responses 配置兼容。
+- 适配 Codex 26.1021.31345：默认队列改用 `runtime.isUsingCopilotInference()`，
+  不再解构 storage。增加独立的完整结构匹配，保留旧版本匹配。
+- UI、直接请求、默认队列、显式队列仍须全部唯一匹配，否则整份补丁不应用。
+- 用新旧三种队列夹具验证 priority、Standard、Copilot、远端及用户关闭增强的行为。
+- 在 26.1021.31345 的真实 `app-initial` 上验证，四处门控各命中一次，模块补丁准备成功。
+  当前 Codex app-server 配合隔离配置、本地 HTTP 接收端也确认发送
+  `POST /v1/responses`，请求包含 `model: "gpt-6-astra"` 和 `service_tier: "priority"`。
 
 ## 本地验证
 

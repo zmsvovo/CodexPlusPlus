@@ -17,9 +17,13 @@ const requestBedrock = async function S$s(e,t){let n=await v$s(e,t);if(n!==`chat
 const queueDefaultBedrock = function Vin(e,{runtime:t,storage:n},r,i){let a=null;return{async readServiceTier(i){for(;a!=null;)await a.catch(()=>void 0);return r(),zin(e.requestClient,e.logger,i,async()=>{if(e.getHostId()===`local`&&await n.readGlobalState(`use-copilot-auth-if-available`)===!0&&await t.isCopilotApiAvailable())return!1;let r=await e.getAccount({priority:`critical`});return r.account?.type===`chatgpt`||r.account?.type===`amazonBedrock`})},async writeServiceTier(t,n){let o=a,s=(async()=>(await o?.catch(()=>void 0),r(),e.sendRequest(`config/batchWrite`,{edits:[{keyPath:n==null?`service_tier`:`profiles.${n}.service_tier`,value:t??`default`,mergeStrategy:`upsert`}],filePath:null,expectedVersion:null,reloadUserConfig:!0})))();a=s;try{return await s}finally{a===s&&(a=null,i())}},writeModel(t,n,r){return e.sendRequest(`config/batchWrite`,a1t(t,n,r))},readShellEnvironmentPolicy(e,t){return Promise.resolve(null)}}}.toString();
 const queueExplicitBedrock = queueExplicit.replace("return t?.type===`chatgpt`?", "return t?.type===`chatgpt`||t?.type===`amazonBedrock`?");
 
+// Codex 26.1021.31345 的默认队列结构；只省略与读取无关的写入实现。
+const queueDefaultCopilotInference = function Vin(e,{runtime:t},n,r){let i=null;return{async readServiceTier(r){for(;i!=null;)await i.catch(()=>void 0);return n(),zin(e.requestClient,e.logger,r,async()=>{if(e.getHostId()===`local`&&await t.isUsingCopilotInference())return!1;let n=await e.getAccount({priority:`critical`});return n.account?.type===`chatgpt`||n.account?.type===`amazonBedrock`})},async writeServiceTier(){}}}.toString();
+
 const shapes = [
   { name: "legacy", fixtures: [ui, request, queueDefault, queueExplicit], bedrockNative: false },
   { name: "bedrock", fixtures: [uiBedrock, requestBedrock, queueDefaultBedrock, queueExplicitBedrock], bedrockNative: true },
+  { name: "copilot-inference", fixtures: [uiBedrock, requestBedrock, queueDefaultCopilotInference, queueExplicitBedrock], bedrockNative: true },
 ];
 
 // 原生 requirements 和 tier 解析函数也直接保留，验证补丁没有绕开它们。
@@ -43,7 +47,7 @@ function environment(patch = true, source = sourceOf(shapes[0].fixtures)) {
     requirements: { requirements: null }, requirementsPending: false,
     config: { model: "model", service_tier: "priority" }, override: { type: "fromConfig" },
     model: { model: "model", isDefault: true, defaultServiceTier: "fast", serviceTiers: [{ id: "priority", name: "Fast" }] },
-    copilotPreferred: false, copilotAvailable: false, accountReads: 0, requirementsReads: 0, publications: 0,
+    copilotPreferred: false, copilotAvailable: false, accountMissing: false, accountReads: 0, requirementsReads: 0, publications: 0,
   };
   const sendRequest = async method => {
     if (method === "configRequirements/read") { state.requirementsReads++; return state.requirements; }
@@ -53,7 +57,7 @@ function environment(patch = true, source = sourceOf(shapes[0].fixtures)) {
   };
   const manager = {
     getHostId: () => state.host,
-    getAccount: async () => { state.accountReads++; return { account: state.accountType == null ? null : { type: state.accountType } }; },
+    getAccount: async () => { state.accountReads++; return { account: state.accountMissing ? null : { type: state.accountType } }; },
     getConversation: () => null, getConversationCwd: () => "/fixture", needsResume: () => false,
     requestClient: { sendRequest }, logger: { error() {} }, sendRequest,
   };
@@ -82,6 +86,7 @@ function environment(patch = true, source = sourceOf(shapes[0].fixtures)) {
   const fns = context.fixtures;
   const queueRuntime = {
     isCopilotApiAvailable: async () => state.copilotAvailable,
+    isUsingCopilotInference: async () => state.copilotPreferred && state.copilotAvailable,
     accountId: () => "fixture", threadMode: () => "default",
   };
   const queue = () => fns.Vin(manager, { runtime: queueRuntime, storage: { readGlobalState: async () => state.copilotPreferred } }, () => {}, () => {});
@@ -177,41 +182,6 @@ async function runShape({ name, fixtures, bedrockNative }) {
   assert.equal(await fns.x$s(env.scope, "local", "model"), "priority");
   state.override = { type: "fromConfig" };
 
-  // 纯自定义供应商没有官方 account：UI、直接请求、默认/显式队列都必须放行。
-  for (const auth of [null, undefined]) {
-    state.auth = auth;
-    state.accountType = auth;
-    api.runtime.configureProvider(true);
-    assert.equal(fns.Mxo().serviceTierAccess.fast, true);
-    assert.equal(await fns.x$s(env.scope, "local", "model", "priority"), "priority");
-    state.accountReads = 0;
-    assert.equal(await env.queue().readServiceTier("model"), "priority");
-    assert.equal(state.accountReads, 1);
-    assert.equal((await env.explicit("priority")).serviceTier, "priority");
-    assert.equal(await fns.x$s(env.scope, "local", "model", "default"), null);
-    assert.equal(await fns.x$s(env.scope, "remote", "model", "priority"), null);
-    assert.equal((await env.explicit("priority", "remote")).serviceTier, null);
-    state.copilotPreferred = state.copilotAvailable = true;
-    assert.equal(await env.queue().readServiceTier("model"), null);
-    assert.equal((await env.explicit("priority")).serviceTier, null);
-    state.copilotPreferred = state.copilotAvailable = false;
-    state.requirements = { requirements: { featureRequirements: { fast_mode: false } } };
-    assert.equal(fns.Mxo().serviceTierAccess.fast, false);
-    assert.equal(await fns.x$s(env.scope, "local", "model", "priority"), null);
-    assert.equal(await env.queue().readServiceTier("model"), null);
-    state.requirements = { requirements: null };
-    api.runtime.update({ ...enabled, codexAppNativeFastUnlock: false });
-    assert.equal(fns.Mxo().serviceTierAccess, null);
-    assert.equal((await env.explicit("priority")).serviceTier, null);
-    api.runtime.update(enabled);
-    api.runtime.configureProvider(false);
-    assert.equal(fns.Mxo().serviceTierAccess, null, "官方未登录或未知供应商不借 null 身份放行");
-    assert.equal(await env.queue().readServiceTier("model"), null);
-    assert.equal((await env.explicit("priority")).serviceTier, null);
-  }
-  state.auth = "apikey";
-  state.accountType = "apiKey";
-
   // 补丁只追加 API key 放行；官方认可的登录方式随 Codex 版本原样保留。
   const officialAuths = ["chatgpt", "personalAccessToken", ...(bedrockNative ? ["amazonBedrock"] : [])];
   for (const auth of ["copilot", "amazonBedrock", null].filter(auth => !officialAuths.includes(auth))) {
@@ -268,11 +238,80 @@ async function runShape({ name, fixtures, bedrockNative }) {
   assert.equal(await env.queue().readServiceTier("model"), null);
   assert.equal((await env.explicit("priority")).serviceTier, null);
 
+  await runLocalCustomApiCases(environment(true, source), name);
   await require("./native-fast-module.test.cjs")({ source, url });
+}
+
+async function runLocalCustomApiCases(env, name) {
+  const { api, state, fns } = env;
+  const configured = { ...enabled, nativeFastLocalApiConfigured: true };
+  state.auth = null;
+  state.accountMissing = true;
+  assert.equal(fns.Mxo().serviceTierAccess, null, `${name}: 不把未知空身份自动当作 API`);
+  assert.equal(await env.queue().readServiceTier("model"), null);
+  api.runtime.update(configured);
+  assert.equal(api.runtime.status().localApiConfigured, true);
+  for (const auth of [null, undefined]) {
+    state.auth = auth;
+    assert.equal(api.runtime.allow("local", auth), true);
+    assert.equal(fns.Mxo().serviceTierAccess.fast, true, `${name}: 本机已确认的自定义 API 恢复入口`);
+    assert.equal(await fns.x$s(env.scope, "local", "model", "priority"), "priority");
+    state.accountReads = 0;
+    assert.equal(await env.queue().readServiceTier("model"), "priority", "默认队列支持原生 account=null");
+    assert.equal(state.accountReads, 1, "空账号默认队列只读取一次身份");
+    state.accountReads = 0;
+    assert.equal((await env.explicit("priority")).serviceTier, "priority", "显式队列与 UI 使用同一策略");
+    assert.equal(state.accountReads, 1);
+    assert.equal(await fns.x$s(env.scope, "local", "model", "default"), null, "Standard 不被强制成 priority");
+  }
+  state.authLoading = true;
+  assert.equal(fns.Mxo().serviceTierAccess, null, "保留原生身份加载状态");
+  state.authLoading = false;
+  state.requirementsPending = true;
+  assert.equal(fns.Mxo().serviceTierAccess, null, "保留原生 requirements 加载状态");
+  state.requirementsPending = false;
+  state.requirements = { requirements: { featureRequirements: { fast_mode: false } } };
+  assert.equal(fns.Mxo().serviceTierAccess.fast, false);
+  assert.equal(await fns.x$s(env.scope, "local", "model", "priority"), null);
+  assert.equal(await env.queue().readServiceTier("model"), null, "自定义 API 也遵循管理员限制");
+  state.requirements = { requirements: null };
+  state.config.service_tier = null;
+  state.model = { model: "model", isDefault: true };
+  assert.equal(await fns.x$s(env.scope, "local", "model"), null, "不制造模型服务等级");
+  assert.equal(await env.queue().readServiceTier("model"), null);
+  state.config.service_tier = "priority";
+  state.copilotPreferred = true;
+  state.copilotAvailable = true;
+  assert.equal(await env.queue().readServiceTier("model"), null, "不覆盖所选 Copilot");
+  assert.equal((await env.explicit("priority")).serviceTier, null);
+  state.copilotPreferred = false;
+  state.copilotAvailable = false;
+  for (const auth of ["", "unknown", "copilot", "ApiKey", "amazonBedrock"]) {
+    assert.equal(api.runtime.allow("local", auth), false, "配置投影不改变其它认证方式");
+  }
+  state.host = "remote";
+  assert.equal(fns.Mxo().serviceTierAccess, null);
+  assert.equal(await fns.x$s(env.scope, "remote", "model", "priority"), null);
+  assert.equal(await env.queue().readServiceTier("model"), null);
+  assert.equal((await env.explicit("priority", "local")).serviceTier, null, "远端 manager 不能借用本机投影");
+  state.host = "local";
+  assert.equal((await env.explicit("priority", "remote")).serviceTier, null);
+  for (const proof of [false, "true", 1, {}, undefined]) {
+    api.runtime.update({ ...enabled, nativeFastLocalApiConfigured: proof });
+    assert.equal(fns.Mxo().serviceTierAccess, null, "缺失、撤销或无效投影必须停止放行");
+    assert.equal(await fns.x$s(env.scope, "local", "model", "priority"), null);
+    assert.equal(await env.queue().readServiceTier("model"), null);
+    assert.equal((await env.explicit("priority")).serviceTier, null);
+  }
+  for (const settings of [{ ...configured, enhancementsEnabled: false }, { ...configured, codexAppNativeFastUnlock: false }]) {
+    api.runtime.update(settings);
+    assert.equal(fns.Mxo().serviceTierAccess, null, "确认 API 连接也不能绕开用户开关");
+  }
 }
 
 async function runNativeFastTests() {
   for (const shape of shapes) await runShape(shape);
+  await require("./native-fast-settings.test.cjs")();
 
   // 补丁文本引用外层绑定；被内层账号解构遮蔽时必须整体放弃。
   const api = environment().api;

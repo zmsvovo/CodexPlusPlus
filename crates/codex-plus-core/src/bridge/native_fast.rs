@@ -24,54 +24,13 @@ struct InterceptorState {
     fetch_attempted: bool,
 }
 
-fn bootstrap_script(enhancements_enabled: bool, native_fast_unlock: bool) -> String {
-    // 只把功能开关送入 renderer，不能把后端 settings（含 relay 凭据）整体序列化。
+fn bootstrap_script(settings: crate::native_fast::RuntimeSettings) -> String {
+    // 只发送功能开关和本机 API 身份投影，不能序列化含供应商凭据的后端 settings。
     format!(
         "{}\n;window.__codexPlusNativeFastUnlock.runtime.update({});\nwindow.__codexPlusNativeFastPatchState='armed';\nwindow.__codexPlusNativeFastAssetPatchReady=true;",
         crate::assets::native_fast_unlock_script(),
-        json!({
-            "enhancementsEnabled": enhancements_enabled,
-            "codexAppNativeFastUnlock": native_fast_unlock,
-        })
+        json!(settings)
     )
-}
-
-// 自定义供应商可以直接使用 bearer/env/header 认证，此时 account/read 返回 null。
-// 只依据活动供应商配置确认这一分支；官方未登录、未知配置都保持关闭。
-fn custom_provider_without_account(contents: &str) -> bool {
-    let Ok(config) = contents.parse::<toml::Value>() else {
-        return false;
-    };
-    let profile = match config.get("profile").and_then(toml::Value::as_str) {
-        Some(name) => match config.get("profiles").and_then(|p| p.get(name)) {
-            Some(profile) => Some(profile),
-            None => return false,
-        },
-        None => None,
-    };
-    let provider_id = profile
-        .and_then(|p| p.get("model_provider"))
-        .or_else(|| config.get("model_provider"))
-        .and_then(toml::Value::as_str);
-    let Some(provider_id) = provider_id.filter(|id| !id.is_empty() && *id != "openai") else {
-        return false;
-    };
-    let Some(provider) = config
-        .get("model_providers")
-        .and_then(|p| p.get(provider_id))
-    else {
-        return false;
-    };
-    let no_account = match provider.get("requires_openai_auth") {
-        None | Some(toml::Value::Boolean(false)) => true,
-        _ => false,
-    };
-    no_account
-        && provider
-            .get("base_url")
-            .and_then(toml::Value::as_str)
-            .and_then(|value| reqwest::Url::parse(value).ok())
-            .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
 pub(super) async fn install(
@@ -85,14 +44,7 @@ pub(super) async fn install(
     let socket = connect_cdp_websocket(websocket_url).await?;
     let mut session = CdpSession::new(socket);
     let mut state = InterceptorState::default();
-    let config =
-        std::fs::read_to_string(crate::relay_config::default_codex_home_dir().join("config.toml"))
-            .unwrap_or_default();
-    let bootstrap = format!(
-        "{}\n;window.__codexPlusNativeFastUnlock.runtime.configureProvider({});",
-        bootstrap_script(true, true),
-        custom_provider_without_account(&config),
-    );
+    let bootstrap = bootstrap_script(crate::native_fast::runtime_settings(&settings));
     let initialized = async {
         let location = evaluate(&mut session, "location.protocol").await?;
         if location
@@ -645,7 +597,11 @@ mod tests {
             let result = initialize_module(
                 &mut session,
                 &mut state,
-                &bootstrap_script(true, true),
+                &bootstrap_script(crate::native_fast::RuntimeSettings {
+                    enhancements_enabled: true,
+                    codex_app_native_fast_unlock: true,
+                    native_fast_local_api_configured: false,
+                }),
                 &generation,
             )
             .await;
@@ -838,9 +794,17 @@ mod tests {
         let mut session = CdpSession::new(socket);
         let mut state = InterceptorState::default();
         tokio::time::timeout(Duration::from_secs(5), async {
-            initialize(&mut session, &mut state, &bootstrap_script(true, true))
-                .await
-                .unwrap();
+            initialize(
+                &mut session,
+                &mut state,
+                &bootstrap_script(crate::native_fast::RuntimeSettings {
+                    enhancements_enabled: true,
+                    codex_app_native_fast_unlock: true,
+                    native_fast_local_api_configured: false,
+                }),
+            )
+            .await
+            .unwrap();
             watch(&mut session, &generation).await.unwrap();
             cleanup(&mut session, &generation, &state).await;
         })
@@ -866,34 +830,6 @@ mod tests {
     }
 
     #[test]
-    fn native_fast_custom_provider_scope() {
-        let custom = "model_provider = 'custom'\n[model_providers.custom]\nbase_url = 'https://example.test/v1'\nexperimental_bearer_token = 'fixture-only'\n";
-        assert!(custom_provider_without_account(custom));
-        assert!(custom_provider_without_account(&format!(
-            "{custom}requires_openai_auth = false\n"
-        )));
-        assert!(!custom_provider_without_account(&format!(
-            "{custom}requires_openai_auth = true\n"
-        )));
-        assert!(!custom_provider_without_account(
-            &custom.replace("custom", "openai")
-        ));
-        assert!(!custom_provider_without_account(
-            "model_provider = 'custom'"
-        ));
-        assert!(!custom_provider_without_account("broken = ["));
-        assert!(!custom_provider_without_account(&format!(
-            "profile = 'missing'\n{custom}"
-        )));
-        assert!(!custom_provider_without_account(&format!(
-            "profile = 'official'\n{custom}[profiles.official]\nmodel_provider = 'openai'\n"
-        )));
-        assert!(custom_provider_without_account(
-            "profile = 'api'\nmodel_provider = 'openai'\n[profiles.api]\nmodel_provider = 'custom'\n[model_providers.custom]\nbase_url = 'https://example.test/v1'\n"
-        ));
-    }
-
-    #[test]
     fn asset_scope_is_local_and_bootstrap_contains_only_feature_settings() {
         assert!(is_local_asset("app://-/assets/app-initial-a.js?x=1"));
         assert!(is_local_asset(
@@ -908,7 +844,11 @@ mod tests {
         ] {
             assert!(!is_local_asset(url), "{url}");
         }
-        let bootstrap = bootstrap_script(true, false);
+        let bootstrap = bootstrap_script(crate::native_fast::RuntimeSettings {
+            enhancements_enabled: true,
+            codex_app_native_fast_unlock: false,
+            native_fast_local_api_configured: true,
+        });
         let (_, update) = bootstrap
             .rsplit_once("\n;window.__codexPlusNativeFastUnlock.runtime.update(")
             .unwrap();
@@ -919,6 +859,7 @@ mod tests {
             json!({
                 "codexAppNativeFastUnlock": false,
                 "enhancementsEnabled": true,
+                "nativeFastLocalApiConfigured": true,
             })
         );
         assert!(bootstrap.contains("__codexPlusNativeFastPatchState='armed'"));
@@ -1023,9 +964,17 @@ mod tests {
         let socket = connect_cdp_websocket(&websocket_url).await.unwrap();
         let mut interceptor = CdpSession::new(socket);
         let mut state = InterceptorState::default();
-        initialize(&mut interceptor, &mut state, &bootstrap_script(true, true))
-            .await
-            .unwrap();
+        initialize(
+            &mut interceptor,
+            &mut state,
+            &bootstrap_script(crate::native_fast::RuntimeSettings {
+                enhancements_enabled: true,
+                codex_app_native_fast_unlock: true,
+                native_fast_local_api_configured: false,
+            }),
+        )
+        .await
+        .unwrap();
         let watching_generation = generation.clone();
         let watcher = tokio::spawn(async move {
             let result = watch(&mut interceptor, &watching_generation).await;

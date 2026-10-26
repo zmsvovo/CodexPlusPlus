@@ -10,10 +10,6 @@
   const literal = "`[A-Za-z]\\w*`";
 
   const runtime = {
-    configureProvider(customProviderWithoutAccount) {
-      // 只接收宿主从本机配置解析出的布尔值，不把 URL 或凭据送入 renderer。
-      root.__codexPlusNativeFastCustomProvider = customProviderWithoutAccount === true;
-    },
     update(settings) {
       root.__codexPlusSettings = settings && typeof settings === "object" ? settings : null;
       return runtime.status();
@@ -26,14 +22,17 @@
         enabled: enhancementsEnabled && optedIn,
         enhancementsEnabled,
         optedIn,
+        localApiConfigured: settings?.nativeFastLocalApiConfigured === true,
         settingsLoaded: !!settings && typeof settings === "object",
       };
     },
     allow(hostId, authMethod) {
-      return hostId === "local"
+      const status = runtime.status();
+      // 自定义供应商直接携带凭据时原生账号可能为空；只能使用后端对生效配置的布尔投影，
+      // 不能把所有 null 身份当作 API key，更不能借本机配置放行远端或其它认证方式。
+      return hostId === "local" && status.enabled
         && (authMethod === "apikey" || authMethod === "apiKey"
-          || authMethod == null && root.__codexPlusNativeFastCustomProvider === true)
-        && runtime.status().enabled;
+          || authMethod == null && status.localApiConfigured);
     },
   };
 
@@ -79,7 +78,8 @@
             `\\k<manager>\\.getHostId\\(\\)===${local}&&await \\k<storage>\\.readGlobalState\\(\`use-copilot-auth-if-available\`\\)===!0&&await \\k<runtime>\\.isCopilotApiAvailable\\(\\)\\?!1:`,
             `(?<gate>(?<account>\\(await \\k<manager>\\.getAccount\\(\\{priority:${critical}\\}\\)\\)\\.account\\?\\.type)===${chatgpt})\\)\\},async writeServiceTier\\(`,
           ].join(""),
-          // includes 只消费一次 account/read；外层 Copilot 分支原样保留。
+          // includes 只消费一次 account/read；空账号也必须经过同一份本机 API 策略。
+          // 外层 Copilot 分支原样保留，不能用本机自定义供应商冒充所选 Copilot。
           replacement: (groups) => `[${chatgpt},...(${allow(`${groups.manager}.getHostId()`, apiKey)}?[${apiKey}]:[]),...(${allow(`${groups.manager}.getHostId()`, "null")}?[null,void 0]:[])].includes(${groups.account})`,
         },
         {
@@ -89,6 +89,19 @@
             `return\\{async readServiceTier\\((?<model>${id})\\)\\{for\\(;\\k<pending>!=null;\\)await \\k<pending>\\.catch\\(\\(\\)=>void 0\\);`,
             `return \\k<before>\\(\\),${id}\\(\\k<manager>\\.requestClient,\\k<manager>\\.logger,\\k<model>,async\\(\\)=>\\{`,
             `if\\(\\k<manager>\\.getHostId\\(\\)===${local}&&await \\k<storage>\\.readGlobalState\\(\`use-copilot-auth-if-available\`\\)===!0&&await \\k<runtime>\\.isCopilotApiAvailable\\(\\)\\)return!1;`,
+            `let (?<result>${id})=await \\k<manager>\\.getAccount\\(\\{priority:${critical}\\}\\);`,
+            `return (?<gate>\\k<result>\\.account\\?\\.type===${chatgpt}(?:\\|\\|\\k<result>\\.account\\?\\.type===${literal})*)\\}\\)\\},async writeServiceTier\\(`,
+          ].join(""),
+          distinct: ["manager", "result"],
+          replacement: (groups) => `(${groups.gate}||${allow(`${groups.manager}.getHostId()`, `${groups.result}.account?.type`)})`,
+        },
+        {
+          // 26.1021：Copilot 判断收进 runtime，默认队列不再解构 storage。
+          pattern: [
+            `function ${id}\\((?<manager>${id}),\\{runtime:(?<runtime>${id})\\},(?<before>${id}),${id}\\)\\{let (?<pending>${id})=null;`,
+            `return\\{async readServiceTier\\((?<model>${id})\\)\\{for\\(;\\k<pending>!=null;\\)await \\k<pending>\\.catch\\(\\(\\)=>void 0\\);`,
+            `return \\k<before>\\(\\),${id}\\(\\k<manager>\\.requestClient,\\k<manager>\\.logger,\\k<model>,async\\(\\)=>\\{`,
+            `if\\(\\k<manager>\\.getHostId\\(\\)===${local}&&await \\k<runtime>\\.isUsingCopilotInference\\(\\)\\)return!1;`,
             `let (?<result>${id})=await \\k<manager>\\.getAccount\\(\\{priority:${critical}\\}\\);`,
             `return (?<gate>\\k<result>\\.account\\?\\.type===${chatgpt}(?:\\|\\|\\k<result>\\.account\\?\\.type===${literal})*)\\}\\)\\},async writeServiceTier\\(`,
           ].join(""),
