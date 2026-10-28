@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 #[cfg(any(target_os = "macos", test))]
 pub mod macos;
 
+#[cfg(windows)]
+pub mod windows;
+
 pub const DEFAULT_REPOSITORY: &str = "zmsvovo/CodexPlusPlus";
 pub const DEFAULT_LATEST_JSON_URL: &str =
     "https://github.com/zmsvovo/CodexPlusPlus/releases/latest/download/latest.json";
@@ -91,6 +94,14 @@ pub fn is_newer_version(candidate: &str, current: &str) -> anyhow::Result<bool> 
     let len = left.len().max(right.len());
     left.resize(len, 0);
     right.resize(len, 0);
+    if left == right {
+        // fork 可在同一上游版本上继续发布修复，不能忽略修订号。
+        let revision = |version: &str| -> u64 {
+            version.trim().split_once("-fork.")
+                .and_then(|(_, value)| value.parse().ok()).unwrap_or(0)
+        };
+        return Ok(revision(candidate) > revision(current));
+    }
     Ok(left > right)
 }
 
@@ -253,7 +264,14 @@ where
             .await
             .map_err(|error| anyhow::anyhow!("准备 macOS 自动更新失败：{error}"))?
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    let launch_result = {
+        let path = installer_path.clone();
+        tokio::task::spawn_blocking(move || windows::launch_update(&path))
+            .await
+            .map_err(|error| anyhow::anyhow!("准备单文件更新失败：{error}"))?
+    };
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     let launch_result = launch_installer(&installer_path);
     if let Err(error) = launch_result {
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -535,7 +553,7 @@ fn platform_asset_rank(name: &str) -> u8 {
         }
         return 1;
     }
-    if cfg!(windows) && is_windows_installer_asset(name) {
+    if cfg!(windows) && is_windows_portable_asset(name) {
         return 0;
     }
     2
@@ -569,14 +587,9 @@ fn is_macos_native_arch_asset(name: &str) -> bool {
     true
 }
 
-fn is_windows_installer_asset(name: &str) -> bool {
-    name.contains("codex")
-        && name.contains("plus")
-        && (name.ends_with(".msi")
-            || name.ends_with("-setup.exe")
-            || name.ends_with("_setup.exe")
-            || name.ends_with("setup.exe")
-            || name.ends_with("installer.exe"))
+fn is_windows_portable_asset(name: &str) -> bool {
+    // 发布流水线固定产出 x64 单文件，不把安装器当作主程序覆盖。
+    name.starts_with("codexplusplus-") && name.ends_with("-windows-x64-portable.exe")
 }
 
 fn is_macos_installer_asset(name: &str) -> bool {

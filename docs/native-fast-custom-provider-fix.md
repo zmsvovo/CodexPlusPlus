@@ -61,11 +61,24 @@ cargo build --release -p codex-plus-manager --bin codex-plus-plus --locked
 
 后续更新流程：合并上游并保留本地修复，推送提交，为该提交创建新的 fork 标签，
 运行 Release assets 工作流（platform=windows、draft=true、publish=true）。
-安装包、ZIP 和 latest.json 齐备后才公开发布；本 fork 不构建需要上游 Apple 凭据的 macOS 包。
+单文件 portable EXE、ZIP 和 latest.json 齐备后才公开发布；本 fork 不构建需要上游 Apple 凭据的 macOS 包。
 仅推送代码不会产生客户端更新；必须完成 Release 发布。
-版本比较仍沿用上游的数字版本规则，`-fork.1` 等标签后缀不参与比较，
-同一上游版本的补发不会触发升级提示，下一次更高数字版本的 Release 才会提示更新。
+从 `2.0.0-fork.1` 开始，数字版本相同时继续比较 `-fork.N` 修订号，
+同一上游版本的 fork 补丁也能触发升级提示。
 
 首次从旧构建迁移需要手动运行本 fork 的新版 EXE；旧 EXE 内置的上游地址不会自动改变。
 手动安装上游官方包仍会覆盖修复和更新来源。
 不要直接把 GitHub 的“丢弃本地提交”同步操作用于本 fork。
+
+## 2026-10-28 单文件更新
+
+同步上游 main `14fec652`（源码版本 2.0.0，尚非上游正式 Release），保留四道 Fast 门控补丁。
+Windows Release 提供 `CodexPlusPlus-<version>-windows-x64-portable.exe`；fork 不再构建 NSIS 安装器。
+新版更新器只选择这个单文件资产，不会把 setup 或其他架构的文件覆盖到当前程序。
+旧版更新器仅识别安装器，因此此次迁移需退出旧版，将 portable EXE 放到可写目录后运行一次。
+
+后续自动更新把新 EXE 暂存到当前 EXE 同目录的唯一事务子目录，校验 x64 PE 文件头，
+启动隐藏 PowerShell 助手并确认就绪后退出，助手等待原进程退出、替换原 EXE、重新启动。
+安装目录不可写时在退出前报错。替换或启动命令失败时尝试恢复旧文件；不检测启动后的业务健康状态。
+事务目录 `.codexpp-update-<uuid>` 保留 `previous.exe` 与 `update.log` 供手动恢复及排查。
+配置沿用现有用户状态目录；不写安装注册表，不创建卸载器，不修改官方 Codex。

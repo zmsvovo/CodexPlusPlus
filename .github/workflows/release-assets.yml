@@ -51,6 +51,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install NSIS
+        if: github.repository != 'zmsvovo/CodexPlusPlus'
         shell: pwsh
         run: |
           $makensis = $null
@@ -93,6 +94,12 @@ jobs:
           Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
           if ((Get-ChildItem dist/windows/app -Filter *.exe).Count -ne 1) { throw "Windows 安装包必须只有一个应用程序。" }
 
+      - name: Stage portable executable
+        shell: pwsh
+        run: |
+          $version = ($env:RELEASE_TAG).TrimStart("v", "V")
+          Copy-Item target/release/codex-plus-plus.exe "dist/windows/CodexPlusPlus-$version-windows-x64-portable.exe"
+
       - name: Build Windows zip asset
         shell: pwsh
         run: |
@@ -101,6 +108,7 @@ jobs:
           Compress-Archive -Path dist/windows/app/* -DestinationPath "dist/windows/CodexPlusPlus-$version-windows-x64.zip" -Force
 
       - name: Build Windows installer
+        if: github.repository != 'zmsvovo/CodexPlusPlus'
         shell: pwsh
         run: |
           $version = ($env:RELEASE_TAG).TrimStart("v", "V")
@@ -313,7 +321,7 @@ jobs:
           const tag = release.tagName || process.env.TAG;
           const version = tag.replace(/^v/i, "");
           const required = [
-            "CodexPlusPlus-" + version + "-windows-x64-setup.exe",
+            "CodexPlusPlus-" + version + "-windows-x64-portable.exe",
             "CodexPlusPlus-" + version + "-windows-x64.zip"
           ];
           if (repo !== "zmsvovo/CodexPlusPlus") {

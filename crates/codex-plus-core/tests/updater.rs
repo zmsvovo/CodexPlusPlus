@@ -16,6 +16,11 @@ fn version_comparison_uses_numeric_segments() {
     assert!(is_newer_version("v1.0.10", "1.0.4").unwrap());
     assert!(!is_newer_version("v1.0.4", "1.0.4").unwrap());
     assert!(!is_newer_version("v1.0.3", "1.0.4").unwrap());
+    assert!(is_newer_version("v2.0.0-fork.2", "2.0.0-fork.1").unwrap());
+    assert!(is_newer_version("v2.0.0-fork.1", "2.0.0").unwrap());
+    assert!(!is_newer_version("v2.0.0-fork.1", "2.0.0-fork.1").unwrap());
+    assert!(!is_newer_version("v2.0.0-fork.1", "2.0.0-fork.2").unwrap());
+    assert!(is_newer_version("v2.0.1-fork.1", "2.0.0-fork.9").unwrap());
 }
 
 #[test]
@@ -27,7 +32,7 @@ fn github_payload_selects_platform_installer() {
         "assets": [
             {"name": "source.zip", "browser_download_url": "https://example.test/source.zip"},
             {"name": "codex-plus-plus-manager.exe", "browser_download_url": "https://example.test/manager.exe"},
-            {"name": "CodexPlusPlus_1.0.9_x64-setup.exe", "browser_download_url": "https://example.test/setup.exe"},
+            {"name": "CodexPlusPlus-1.0.9-windows-x64-portable.exe", "browser_download_url": "https://example.test/setup.exe"},
             {"name": "CodexPlusPlus_1.0.9_x64.dmg", "browser_download_url": "https://example.test/app.dmg"}
         ]
     }))
@@ -37,7 +42,7 @@ fn github_payload_selects_platform_installer() {
     if cfg!(windows) {
         assert_eq!(
             release.asset_name.as_deref(),
-            Some("CodexPlusPlus_1.0.9_x64-setup.exe")
+            Some("CodexPlusPlus-1.0.9-windows-x64-portable.exe")
         );
     } else if cfg!(target_os = "macos") {
         assert_eq!(
@@ -57,7 +62,7 @@ fn latest_json_payload_selects_platform_installer_without_github_api_shape() {
         "body": "静态更新描述",
         "assets": [
             {"name": "source.zip", "url": "https://example.test/source.zip"},
-            {"name": "CodexPlusPlus-1.1.6-windows-x64-setup.exe", "url": "https://example.test/setup.exe"},
+            {"name": "CodexPlusPlus-1.1.6-windows-x64-portable.exe", "url": "https://example.test/setup.exe"},
             {"name": "CodexPlusPlus-1.1.6-macos-x64.dmg", "url": "https://example.test/app.dmg"}
         ]
     }))
@@ -68,7 +73,7 @@ fn latest_json_payload_selects_platform_installer_without_github_api_shape() {
     if cfg!(windows) {
         assert_eq!(
             release.asset_name.as_deref(),
-            Some("CodexPlusPlus-1.1.6-windows-x64-setup.exe")
+            Some("CodexPlusPlus-1.1.6-windows-x64-portable.exe")
         );
     } else if cfg!(target_os = "macos") {
         assert_eq!(
@@ -92,7 +97,7 @@ fn asset_selection_prefers_current_platform_artifacts() {
             "https://example.test/manager.exe".to_string(),
         ),
         (
-            "CodexPlusPlus_1.0.9_x64-setup.exe".to_string(),
+            "CodexPlusPlus-1.0.9-windows-x64-portable.exe".to_string(),
             "https://example.test/setup.exe".to_string(),
         ),
         (
@@ -103,7 +108,7 @@ fn asset_selection_prefers_current_platform_artifacts() {
 
     if cfg!(windows) {
         let selected = select_update_asset(&assets).unwrap();
-        assert_eq!(selected.name, "CodexPlusPlus_1.0.9_x64-setup.exe");
+        assert_eq!(selected.name, "CodexPlusPlus-1.0.9-windows-x64-portable.exe");
     } else if cfg!(target_os = "macos") {
         let selected = select_update_asset(&assets).unwrap();
         assert_eq!(selected.name, "CodexPlusPlus_1.0.9_x64.dmg");
@@ -216,4 +221,19 @@ fn download_asset_to_writes_bytes() {
 
     assert_eq!(path, dir.path().join("pkg.zip"));
     assert_eq!(std::fs::read(path).unwrap(), b"abcdef");
+}
+
+#[test]
+fn windows_update_never_selects_installer_or_other_architecture() {
+    let assets: Vec<_> = [
+        "CodexPlusPlus-2.0.0-windows-x64-setup.exe",
+        "CodexPlusPlus-2.0.0-windows-arm64-portable.exe",
+        "codex-plus-plus-manager.exe",
+    ].into_iter().map(|name| (name.to_owned(), format!("https://example.test/{name}"))).collect();
+    assert!(select_update_asset(&assets).is_none());
+    let mut mixed = assets;
+    mixed.push(("CodexPlusPlus-2.0.0-windows-x64-portable.exe".into(), "https://example.test/portable.exe".into()));
+    if cfg!(windows) {
+        assert_eq!(select_update_asset(&mixed).unwrap().browser_download_url, "https://example.test/portable.exe");
+    }
 }
