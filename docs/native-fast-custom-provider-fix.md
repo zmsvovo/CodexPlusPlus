@@ -48,7 +48,7 @@ cd apps/codex-plus-manager
 npm install --package-lock=false --no-audit --no-fund
 npm run vite:build
 cd ../..
-cargo test --release -p codex-plus-core native_fast --lib --test native_fast_unlock --locked
+cargo test --release -p codex-plus-core native_fast --lib --test all --locked
 cargo build --release -p codex-plus-manager --bin codex-plus-plus --locked
 ```
 
@@ -59,8 +59,9 @@ cargo build --release -p codex-plus-manager --bin codex-plus-plus --locked
 入口为 `https://github.com/zmsvovo/CodexPlusPlus/releases/latest/download/latest.json`，
 不会回退到上游安装包。关于页的项目链接也指向本 fork。
 
-后续更新流程：合并上游并保留本地修复，推送提交，为该提交创建新的 fork 标签，
-运行 Release assets 工作流（platform=windows、draft=true、publish=true）。
+后续更新流程：合并上游并保留本地修复，推送提交及新的 `v<版本>-fork.N` 标签，
+标签推送会自动触发 Release assets 工作流并发布。需要补跑时使用 workflow_dispatch
+（tag=已有标签、platform=windows、publish=true），不再提供 draft 参数。
 单文件 portable EXE、ZIP 和 latest.json 齐备后才公开发布；本 fork 不构建需要上游 Apple 凭据的 macOS 包。
 仅推送代码不会产生客户端更新；必须完成 Release 发布。
 从 `2.0.0-fork.1` 开始，数字版本相同时继续比较 `-fork.N` 修订号，
