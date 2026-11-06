@@ -2,6 +2,12 @@
 
 本文件为 CodexPlusPlus 的工作规范，指导 agent 在本仓库工作。
 
+## 本 fork 的上游同步规则
+
+- 只同步上游已公开发布的正式 GitHub Release（`draft=false`、`prerelease=false`），并合并该 Release 标签对应的固定提交。
+- 不直接追踪上游 `main` 的未发布提交，也不同步预发布版或仅有标签、尚未正式发布的版本。
+- 同步时保留本 fork 的 Fast 兼容补丁、自己的更新源和 Windows 单文件更新方式。
+
 ## 项目概述
 
 本仓库是用户自己的 [CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 仓库，支持按模型粒度配置上下文窗口与自动压缩阈值（对应 issue #1171 / #931）。

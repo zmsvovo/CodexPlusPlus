@@ -59,7 +59,10 @@ cargo build --release -p codex-plus-manager --bin codex-plus-plus --locked
 入口为 `https://github.com/zmsvovo/CodexPlusPlus/releases/latest/download/latest.json`，
 不会回退到上游安装包。关于页的项目链接也指向本 fork。
 
-后续更新流程：合并上游并保留本地修复，推送提交及新的 `v<版本>-fork.N` 标签，
+上游同步仅选择已公开的正式 GitHub Release（非草稿、非预发布），合并其标签对应的固定提交；
+不直接同步 `main` 的未发布提交。`fork.N` 仅表示本 fork 在正式版基础上的定制补丁修订。
+
+后续更新流程：合并上游正式版并保留本地修复，推送提交及新的 `v<版本>-fork.N` 标签，
 标签推送会自动触发 Release assets 工作流并发布。需要补跑时使用 workflow_dispatch
 （tag=已有标签、platform=windows、publish=true），不再提供 draft 参数。
 单文件 portable EXE、ZIP 和 latest.json 齐备后才公开发布；本 fork 不构建需要上游 Apple 凭据的 macOS 包。
