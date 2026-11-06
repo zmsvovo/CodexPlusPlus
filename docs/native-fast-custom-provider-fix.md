@@ -82,3 +82,19 @@ Windows Release 提供 `CodexPlusPlus-<version>-windows-x64-portable.exe`；fork
 安装目录不可写时在退出前报错。替换或启动命令失败时尝试恢复旧文件；不检测启动后的业务健康状态。
 事务目录 `.codexpp-update-<uuid>` 保留 `previous.exe` 与 `update.log` 供手动恢复及排查。
 配置沿用现有用户状态目录；不写安装注册表，不创建卸载器，不修改官方 Codex。
+
+## 2026-11-06：Codex 26.1103 / Codex++ 2.3.1-fork.1
+
+同步上游 7d7832ed（v2.3.1）。现场 Codex 为 26.1103.31037 / build 25241，运行中的 Codex++ 为 2.0.0-fork.1；增强与 Fast 开关都已启用，补丁却处于 failed。
+旧版 app-initial 模块已换成 Rspack 数字资源名；上游 2.3.1 的 Rspack 适配也仍缺少本次结构。
+
+补充模块注册顺序变化、无单数 esm_id 的分块、匿名 async 请求函数、内联默认配置 helper，以及 Promise.all 内联的显式队列。
+只读核验实际模块，三个工厂 PAzX、V7mA、ipV4 内的四处门控均唯一命中；准备的补丁分块为 app://-/assets/782259.7a3e865ee5.js。
+新增合成回归样例，不将官方源码复制进仓库。保留本机 API 身份、增强开关、Copilot、远端及 Standard 边界。
+
+当前 Codex 自带 CLI 在隔离配置下向本机 HTTP 接收端实际发送 POST /v1/responses，model=gpt-6-astra、service_tier=priority。
+此验证确认客户端发送参数，不代表供应商兑现加速；未向付费服务发送请求。运行中的 Codex 需要通过新版 Codex++ 完整重启以应用新补丁。
+
+验证命令：
+- cargo test --release -p codex-plus-core --lib --test all native_fast --locked
+- cargo test --release -p codex-plus-core --test all updater:: --locked

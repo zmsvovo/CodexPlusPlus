@@ -18,8 +18,8 @@ use crate::settings::RelayProfile;
 use crate::tools::ToolId;
 
 const STORE_FILE: &str = "gateway.json";
-/// 2：`restore_on_exit` 默认改为开启（见 [`read_store`] 里的迁移）。
-const STORE_VERSION: u32 = 3;
+/// 3：`auto_models` 默认改为开启；4：`restore_on_exit` 默认改为关闭（见 [`read_store`] 里的迁移）。
+const STORE_VERSION: u32 = 4;
 /// 客户端 token 前缀；日志里看到它就知道是网关签发的本地凭据，不是上游 Key。
 pub const CLIENT_TOKEN_PREFIX: &str = "cpx-gw-";
 
@@ -54,6 +54,13 @@ pub struct GatewayProvider {
     /// 与直连模式的「供应商独立代理」互不相干。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub proxy: String,
+    /// 主动限速（#1130 / #2726）：每个 Key 每分钟最多发出的请求数，按滑动 60 秒计。
+    /// 不填（None）表示不限，行为和没有这项设置时完全一样；旧文件读进来也是 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_rpm: Option<u32>,
+    /// 主动限速：每个 Key 同时进行中的最多请求数（流式响应读完才算结束）。不填表示不限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_concurrency: Option<u32>,
     /// 上次检查上游时，上游有、列表里没有的模型（界面提示「有新模型」，保存模型列表后清掉）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstream_new: Vec<String>,
@@ -63,6 +70,14 @@ pub struct GatewayProvider {
     /// 上次检查上游模型的时间（毫秒），0 表示没检查过。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub models_checked_at_ms: u64,
+    /// new-api 中转站的访问令牌与用户 ID（#2793）：只用来查账户余额，留空不查。
+    /// 和 Key 一样只存在 gateway.json，界面只拿到打码后的样子。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newapi_access: Option<crate::relay_billing::NewApiAccess>,
+    /// 上次「从上游同步上下文窗口 / 思考等级」写进去的值（#2807）。
+    /// 现值和这里一样说明是同步来的，下次同步默认可覆盖；不一样就是用户手动改过的，默认不覆盖。
+    #[serde(default, skip_serializing_if = "UpstreamMetaRecord::is_empty")]
+    pub upstream_meta: UpstreamMetaRecord,
     pub relay: RelayProfile,
     /// 不认识的字段（更新版本写的）原样保留，保存时写回，回滚后再升级不丢数据。
     #[serde(flatten)]
@@ -71,6 +86,39 @@ pub struct GatewayProvider {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+/// 从上游同步写入的模型资料记录（#2807），键是小写、去掉 `[1M]` 后缀的模型名。
+/// 只用来区分「同步来的」和「用户手动设的」，不参与路由和 Agent 配置。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamMetaRecord {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub windows: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning: BTreeMap<String, SyncedReasoning>,
+}
+
+impl UpstreamMetaRecord {
+    pub fn is_empty(&self) -> bool {
+        self.windows.is_empty() && self.reasoning.is_empty()
+    }
+
+    /// 去掉 `gone` 判定为已删除的模型的记录。
+    pub fn retain_models(&mut self, keep: impl Fn(&str) -> bool) {
+        self.windows.retain(|model, _| keep(model));
+        self.reasoning.retain(|model, _| keep(model));
+    }
+}
+
+/// 同步写入的一组思考等级。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncedReasoning {
+    #[serde(default)]
+    pub levels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_level: Option<String>,
 }
 
 impl GatewayProvider {
@@ -86,6 +134,14 @@ impl GatewayProvider {
             })
             .map(|(_, price)| price)
             .or(self.price.as_ref())
+    }
+
+    /// 这家每个 Key 的主动限速上限；0 当作不限。
+    pub fn key_limits(&self) -> crate::gateway::key_pool::KeyLimits {
+        crate::gateway::key_pool::KeyLimits {
+            rpm: self.key_rpm.filter(|value| *value > 0),
+            concurrency: self.key_concurrency.filter(|value| *value > 0),
+        }
     }
 }
 
@@ -304,6 +360,10 @@ pub struct GatewayRestoreState {
     /// 写进各 Agent 配置时用的网关端口；端口变化后要重写。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_port: Option<u16>,
+    /// 退出 / 更新前还原成直连后，Agent 配置里连的地址。下次启动重新接回网关前比对：
+    /// 变了说明用户在这期间用别的工具改过，不再接回（会盖掉用户的新选择）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_endpoint: Option<String>,
     /// 不认识的字段原样保留。
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -326,6 +386,17 @@ pub struct AgentBinding {
     pub claude_roles: ClaudeRoleModels,
     #[serde(default, deserialize_with = "lenient")]
     pub unknown_model: UnknownModelPolicy,
+    /// 审批模型（#2703，目前只有 Codex 用）：Codex「替我审批」固定请求 `codex-auto-review`，
+    /// 默认按「未知模型」策略改写成主模型；主模型是 ChatGPT 账号或含账号的模型组时会消耗订阅额度。
+    /// 填了就把审批请求改发到这个模型（`<供应商 id>/<模型>`、裸模型名或 `group/<组 id>`）。
+    /// 空串表示未设置，保持原有行为。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auto_review_model: String,
+    /// 起名模型（目前只有 Codex 用）：Codex 给会话起名 / 定期重新起名时另开临时线程，
+    /// 用它内置的轻量模型（如 gpt-6-luna）或会话当前模型，池里有 ChatGPT 账号时会落到订阅额度上。
+    /// 填了就把识别出的起名请求改发到这个模型（写法同审批模型）；空串表示不改，保持原有行为。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title_model: String,
     /// 写给 Agent 的上下文窗口（Claude Code 的 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
@@ -356,6 +427,8 @@ impl Default for AgentBinding {
             extra_models: Vec::new(),
             claude_roles: ClaudeRoleModels::default(),
             unknown_model: UnknownModelPolicy::default(),
+            auto_review_model: String::new(),
+            title_model: String::new(),
             context_window: None,
             claude_enable_effort: false,
             pool_exclude: Vec::new(),
@@ -424,10 +497,10 @@ pub struct GatewaySettings {
     pub key_policy: KeyPolicy,
     /// 退出 Codex++ 时把走网关的 Agent 恢复成直连，避免网关不在时连不上。
     ///
-    /// 默认开：网关跟着 Codex++ 一起退出，不恢复的话 Agent 全都连不上；降级到不认识网关的旧版时同理。
-    /// 旧文件（version < 2）里的 `false` 多半是当年的默认值、不是用户选的，读的时候统一迁移成开，
-    /// 见 [`read_store`]。
-    #[serde(default = "enabled_by_default")]
+    /// 默认关：Agent 一直指着网关，下次打开 Codex++ 就能接着用，不用每次退出、启动都改一遍 Agent 的配置。
+    /// 安装更新前不看这个开关，照样还原（见 [`crate::gateway::apply::restore_all_for_exit`]）。
+    /// 2.0.0 发布前的开发版默认开、文件里总会写出 `true`，读的时候统一迁移成关，见 [`read_store`]。
+    #[serde(default)]
     pub restore_on_exit: bool,
     /// 退出或安装更新前已经把开着的 Agent 恢复成直连（绑定仍是开启）：下次启动要重新接回网关。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -441,6 +514,11 @@ pub struct GatewaySettings {
     /// 左键点托盘图标弹出快捷面板（默认开）；关掉时托盘保持原来的点击行为。
     #[serde(default = "enabled_by_default")]
     pub tray_panel: bool,
+    /// 关闭管理器主窗口时进入轻量模式：销毁主窗口（连同 WebView 渲染进程）释放内存，
+    /// 后端、网关、托盘照常运行，再打开时按原配置重建窗口（#2677）。
+    /// 默认关（opt-in）：关时是只隐藏窗口的旧行为。和 `tray_panel` 一样放在这里，由管理器的专用命令读写。
+    #[serde(default)]
+    pub lightweight_on_close: bool,
     /// 自动建组：多家都有的模型自动成一个组（Agent 选不带供应商的模型名时走它）。默认开；
     /// 旧文件（version < 3）里的 false 是当时的默认值，读的时候迁移成开，见 [`read_store`]。
     #[serde(default = "enabled_by_default")]
@@ -449,14 +527,28 @@ pub struct GatewaySettings {
     /// 关掉时名字后面换成看不见的字符：分组脚本照样能分清是哪一家，界面上只显示模型名。
     #[serde(default = "enabled_by_default")]
     pub model_suffix: bool,
+    /// 发现本机已登录的订阅账号（Kiro、Cursor、Gemini CLI 等官方客户端的登录文件）：
+    /// 开着时供应商页提示可以导入。默认关（opt-in）：关着时不读这些登录文件。
+    #[serde(default)]
+    pub local_login_discovery: bool,
     /// 自动组上改过的设置（键是小写模型名）。没改过的自动组不落盘，跟着供应商池自动变化。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub auto_groups: BTreeMap<String, AutoGroupSettings>,
     /// 收藏的模型（管理器模型下拉里点的星标）：写给 Codex 的模型目录时标出来，Codex 的选择器里也显示星标。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub favorite_models: Vec<String>,
-    /// 生图模型：空串是自动（见 [`crate::gateway::images`]），`off` 是关闭，其余是 `<供应商 id>/<模型>`。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// 各 Agent 的生图模型（键是 Agent id）：没有或空串是自动（见 [`crate::gateway::images`]），
+    /// `off` 是关闭，其余是 `<供应商 id>/<模型>`。不放在 [`AgentBinding`] 里：界面保存绑定时整份替换。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub image_models: BTreeMap<String, String>,
+    /// 生图结果只给链接时原样转发、不下载成图片数据的 Agent（默认都转，见 [`Self::inline_image_urls_for`]）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_keep_urls: Vec<String>,
+    /// 模型下拉里不列自带模型（直连，不经 Codex++）的 Agent（默认都列，见 [`Self::shows_own_models_for`]）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hide_own_models: Vec<String>,
+    /// 旧版的全局生图模型，读的时候迁移给 Codex（见 [`read_store`]），之后不再写。
+    #[serde(default, skip_serializing)]
     pub image_model: String,
     /// 最后写这个文件的 Codex++ 版本。降级到旧版时旧版不会跑这里的代码，只留个记录方便排查。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -476,15 +568,20 @@ impl Default for GatewaySettings {
             version: 0,
             bindings: BTreeMap::new(),
             key_policy: KeyPolicy::default(),
-            restore_on_exit: true,
+            restore_on_exit: false,
             restored_at_exit: false,
             providers: Vec::new(),
             groups: Vec::new(),
             tray_panel: true,
+            lightweight_on_close: false,
             auto_models: true,
             model_suffix: true,
+            local_login_discovery: false,
             auto_groups: BTreeMap::new(),
             favorite_models: Vec::new(),
+            image_models: BTreeMap::new(),
+            image_keep_urls: Vec::new(),
+            hide_own_models: Vec::new(),
             image_model: String::new(),
             app_version: String::new(),
             extra: Map::new(),
@@ -497,6 +594,24 @@ impl GatewaySettings {
         self.providers
             .iter()
             .find(|provider| provider.relay.id == id)
+    }
+
+    /// 某个 Agent 的生图模型设置（空串是自动）。
+    pub fn image_model_for(&self, agent: &ToolId) -> &str {
+        self.image_models
+            .get(agent.as_str())
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+
+    /// 这个 Agent 的生图结果只给链接时，要不要下载下来补成 `b64_json`。
+    pub fn inline_image_urls_for(&self, agent: &ToolId) -> bool {
+        !self.image_keep_urls.iter().any(|id| id == agent.as_str())
+    }
+
+    /// 这个 Agent 的模型下拉里要不要列它自带的模型。
+    pub fn shows_own_models_for(&self, agent: &ToolId) -> bool {
+        !self.hide_own_models.iter().any(|id| id == agent.as_str())
     }
 
     pub fn group(&self, id: &str) -> Option<&GatewayGroup> {
@@ -555,6 +670,142 @@ impl Default for GatewayStore {
             path: Self::default_path(),
         }
     }
+}
+
+impl GatewaySettings {
+    /// 并入拓展声明的模型供应商（不落盘）：来源记为 `extension:<拓展 id>`，与已有供应商同 id 时以已有的为准，
+    /// 拓展写了 `override: true` 时顶替已有的（位置不变）。
+    /// 只在构建 Agent 的模型资料与网关路由这些只读的地方调用，不要在读-改-写里用，免得写进 gateway.json。
+    ///
+    /// 网关每个请求都会走到这里：拓展目录的扫描结果缓存 3 秒，拓展启停、改配置后很快生效。
+    pub fn with_extension_providers(self) -> Self {
+        type Cached = (std::time::Instant, Vec<(String, crate::user_scripts::ExtensionProvider)>);
+        static CACHE: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
+        let providers = {
+            let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match cache.as_ref() {
+                Some((at, list)) if at.elapsed() < std::time::Duration::from_secs(3) => list.clone(),
+                _ => {
+                    let list = crate::user_scripts::default_user_script_manager()
+                        .enabled_extension_providers()
+                        .unwrap_or_default();
+                    *cache = Some((std::time::Instant::now(), list.clone()));
+                    list
+                }
+            }
+        };
+        self.merge_extension_providers(providers)
+    }
+
+    pub fn with_extension_providers_from(self, manager: &crate::user_scripts::UserScriptManager) -> Self {
+        let providers = manager.enabled_extension_providers().unwrap_or_default();
+        self.merge_extension_providers(providers)
+    }
+
+    fn merge_extension_providers(mut self, providers: Vec<(String, crate::user_scripts::ExtensionProvider)>) -> Self {
+        for (extension, mut provider) in providers {
+            let existing = self.providers.iter().position(|existing| existing.relay.id == provider.id);
+            if existing.is_some() && !provider.override_existing {
+                continue;
+            }
+            if provider.discover_models {
+                for model in discovered_extension_models(&provider) {
+                    if !provider.models.contains(&model) {
+                        provider.models.push(model);
+                    }
+                }
+            }
+            let relay = RelayProfile {
+                id: provider.id.clone(),
+                name: provider.name.clone(),
+                base_url: provider.base_url.clone(),
+                api_key: provider.api_key.clone(),
+                no_auth: provider.api_key.is_empty(),
+                protocol: match provider.protocol.as_str() {
+                    "chat" => crate::settings::RelayProtocol::ChatCompletions,
+                    "anthropic" => crate::settings::RelayProtocol::AnthropicMessages,
+                    _ => crate::settings::RelayProtocol::Responses,
+                },
+                model: provider.models.first().cloned().unwrap_or_default(),
+                model_list: provider.models.join("\n"),
+                ..RelayProfile::default()
+            };
+            let entry = GatewayProvider {
+                enabled: true,
+                source: format!("extension:{extension}"),
+                price: None,
+                model_prices: BTreeMap::new(),
+                model_windows: BTreeMap::new(),
+                context_window: None,
+                proxy: String::new(),
+                key_rpm: None,
+                key_concurrency: None,
+                upstream_new: Vec::new(),
+                upstream_gone: Vec::new(),
+                models_checked_at_ms: 0,
+                newapi_access: None,
+                upstream_meta: Default::default(),
+                relay,
+                extra: Map::new(),
+            };
+            match existing {
+                Some(index) => self.providers[index] = entry,
+                None => self.providers.push(entry),
+            }
+        }
+        self
+    }
+}
+
+/// 拓展供应商从上游拉到的模型：供应商 id + 地址 → (拉取时间, 模型)。过期就在后台重拉，这次先用旧的。
+type DiscoveredModels = std::collections::HashMap<String, (std::time::Instant, Vec<String>)>;
+static DISCOVERED_MODELS: std::sync::LazyLock<std::sync::Mutex<DiscoveredModels>> = std::sync::LazyLock::new(Default::default);
+const DISCOVERY_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn discovered_extension_models(provider: &crate::user_scripts::ExtensionProvider) -> Vec<String> {
+    let key = format!("{}|{}", provider.id, provider.base_url);
+    let (models, stale) = {
+        let mut cache = DISCOVERED_MODELS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match cache.get(&key) {
+            Some((at, models)) => (models.clone(), at.elapsed() > DISCOVERY_TTL),
+            None => {
+                // 先占位，免得并发请求各拉一遍。
+                cache.insert(key.clone(), (std::time::Instant::now(), Vec::new()));
+                (Vec::new(), true)
+            }
+        }
+    };
+    if stale {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let relay = RelayProfile {
+                id: provider.id.clone(),
+                base_url: provider.base_url.clone(),
+                api_key: provider.api_key.clone(),
+                no_auth: provider.api_key.is_empty(),
+                protocol: match provider.protocol.as_str() {
+                    "chat" => crate::settings::RelayProtocol::ChatCompletions,
+                    "anthropic" => crate::settings::RelayProtocol::AnthropicMessages,
+                    _ => crate::settings::RelayProtocol::Responses,
+                },
+                ..RelayProfile::default()
+            };
+            DISCOVERED_MODELS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(key.clone()).and_modify(|entry| entry.0 = std::time::Instant::now());
+            handle.spawn(async move {
+                match crate::gateway::model_sync::upstream_models(&relay).await {
+                    Ok(models) => {
+                        DISCOVERED_MODELS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(key, (std::time::Instant::now(), models));
+                    }
+                    Err(error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "extension_providers.discover_failed",
+                            serde_json::json!({ "provider": relay.id, "error": format!("{error:#}") }),
+                        );
+                    }
+                }
+            });
+        }
+    }
+    models
 }
 
 impl GatewayStore {
@@ -625,15 +876,22 @@ fn read_store(path: &Path) -> anyhow::Result<GatewaySettings> {
     }
     let mut settings: GatewaySettings =
         serde_json::from_str(&text).with_context(|| format!("无法解析 {}", path.display()))?;
-    // 版本 1 及更早的文件里 `restoreOnExit` 总会写出来，默认值 false 与用户主动关掉的分不开。
-    // 不恢复的后果是退出或降级后 Agent 全部连不上，所以整体迁移成开；用户真想关，再关一次即可
-    // （之后的文件是版本 2，不再迁移）。
-    if settings.version < 2 {
-        settings.restore_on_exit = true;
+    // 版本 4 之前只有发布前的开发版，`restoreOnExit` 总会写出来，是当时的默认值（开）而不是用户选的：
+    // 统一迁移成关；用户想要，再打开一次即可（之后的文件是版本 4，不再迁移）。
+    if settings.version < 4 {
+        settings.restore_on_exit = false;
     }
     // 版本 2 的 `autoModels: false` 是那时「多家自动切换」的默认值；自动建组改成默认开以后统一迁移成开。
     if settings.version < 3 {
         settings.auto_models = true;
+    }
+    // 旧版只有一个全局生图模型，当时只有 Codex 会发生图请求：迁移成 Codex 的。
+    let legacy_image = std::mem::take(&mut settings.image_model);
+    if !legacy_image.trim().is_empty() {
+        settings
+            .image_models
+            .entry(ToolId::Codex.as_str().to_string())
+            .or_insert(legacy_image);
     }
     // 地址、默认模型、Key 落盘时存在 config / auth 文本里，读回来要像 settings.json 一样还原出来。
     for provider in &mut settings.providers {
@@ -816,6 +1074,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_global_image_model_moves_to_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("gateway.json");
+        fs::write(&path, r#"{ "version": 3, "imageModel": "jo/gpt-image-2" }"#).unwrap();
+        let store = GatewayStore::at(path.clone());
+        let settings = store.load().unwrap();
+        assert_eq!(settings.image_model_for(&ToolId::Codex), "jo/gpt-image-2");
+        assert_eq!(settings.image_model_for(&ToolId::Grok), "");
+        assert!(settings.inline_image_urls_for(&ToolId::Codex));
+        store.save(&settings).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"imageModel\""), "旧字段不再写：{text}");
+        assert!(text.contains("\"imageModels\""), "{text}");
+    }
+
+    #[test]
     fn missing_file_reads_as_all_disabled() {
         let temp = tempfile::tempdir().unwrap();
         let store = GatewayStore::at(temp.path().join("gateway.json"));
@@ -824,6 +1098,8 @@ mod tests {
         assert!(settings.tray_panel, "托盘快捷面板默认开");
         let old: GatewaySettings = serde_json::from_str("{}").unwrap();
         assert!(old.tray_panel, "旧文件没有这个字段时也是开");
+        assert!(!settings.lightweight_on_close, "关窗进入轻量模式默认关（opt-in）");
+        assert!(!old.lightweight_on_close, "旧文件没有这个字段时也是关");
         assert!(settings.active_binding(&ToolId::Claude).is_none());
     }
 
@@ -843,7 +1119,7 @@ mod tests {
         );
         store.save(&settings).unwrap();
         let text = std::fs::read_to_string(&store.path).unwrap();
-        assert!(text.contains("\"version\": 3"), "{text}");
+        assert!(text.contains("\"version\": 4"), "{text}");
         assert!(
             text.contains(&format!("\"appVersion\": \"{}\"", crate::version::VERSION)),
             "记下写文件的版本：{text}"
@@ -893,9 +1169,13 @@ mod tests {
             model_windows: Default::default(),
             context_window: None,
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
+            newapi_access: None,
+            upstream_meta: Default::default(),
             relay: RelayProfile {
                 id: "deepseek".to_string(),
                 ..RelayProfile::default()
@@ -904,6 +1184,41 @@ mod tests {
         });
         assert_eq!(settings.unique_slug("DeepSeek", false), "deepseek-2");
         assert_eq!(settings.unique_slug("", true), "unnamed");
+    }
+
+    /// 主动限速：旧文件没有这两项时是不限；保存后写成 keyRpm / keyConcurrency，0 当作不限、不写出。
+    #[test]
+    fn key_limits_default_to_unlimited_and_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        std::fs::write(
+            &store.path,
+            r#"{"version":4,"providers":[{"relay":{"id":"ds","name":"DS"}}]}"#,
+        )
+        .unwrap();
+        let settings = store.load().unwrap();
+        assert_eq!(settings.providers[0].key_rpm, None);
+        assert_eq!(settings.providers[0].key_concurrency, None);
+        assert!(settings.providers[0].key_limits().is_unlimited());
+
+        crate::gateway::apply::set_provider_limits(&store, "ds", Some(10), Some(0)).unwrap();
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        assert!(text.contains("\"keyRpm\": 10"), "{text}");
+        assert!(
+            !text.contains("keyConcurrency"),
+            "0 表示不限，不写出：{text}"
+        );
+        let limits = store.load().unwrap().providers[0].key_limits();
+        assert_eq!(limits.rpm, Some(10));
+        assert_eq!(limits.concurrency, None);
+
+        crate::gateway::apply::set_provider_limits(&store, "ds", None, None).unwrap();
+        assert!(
+            store.load().unwrap().providers[0]
+                .key_limits()
+                .is_unlimited()
+        );
+        assert!(crate::gateway::apply::set_provider_limits(&store, "nope", Some(1), None).is_err());
     }
 
     /// 回滚到这一版后：更新版本写的未知字段、枚举新取值都要能读，保存后原样还在。
@@ -948,12 +1263,13 @@ mod tests {
         assert_eq!(binding.unknown_model, UnknownModelPolicy::MapToDefault);
         assert!(
             !settings.restore_on_exit,
-            "版本 2 之后的文件里显式关掉的保持关"
+            "版本 4 之后的文件里显式关掉的保持关"
         );
 
         // 改一点别的再保存。
         settings.groups[1].mode = GroupMode::Weighted;
         settings.tray_panel = false;
+        settings.lightweight_on_close = true;
         store.save(&settings).unwrap();
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&store.path).unwrap()).unwrap();
@@ -975,26 +1291,27 @@ mod tests {
         assert_eq!(saved["groups"][0]["futureGroup"], 3);
         assert_eq!(saved["groups"][1]["mode"], "weighted", "改过的照新值写");
         assert_eq!(saved["trayPanel"], false);
+        assert_eq!(saved["lightweightOnClose"], true);
         // 再读一遍还是同样的内容。
         let again = store.load().unwrap();
         assert_eq!(again.groups[0].extra["futureGroup"], 3);
     }
 
     #[test]
-    fn restore_on_exit_defaults_on_and_old_files_migrate() {
-        assert!(GatewaySettings::default().restore_on_exit);
+    fn restore_on_exit_defaults_off_and_old_files_migrate() {
+        assert!(!GatewaySettings::default().restore_on_exit);
         let temp = tempfile::tempdir().unwrap();
         let store = GatewayStore::at(temp.path().join("gateway.json"));
-        // 版本 1 的文件总会写出 false（当年的默认值），读的时候迁移成开。
-        std::fs::write(&store.path, r#"{"version":1,"restoreOnExit":false}"#).unwrap();
-        assert!(store.load().unwrap().restore_on_exit);
-        std::fs::write(&store.path, r#"{"bindings":{}}"#).unwrap();
-        assert!(store.load().unwrap().restore_on_exit);
-        // 迁移后用户再关掉：存成版本 2，之后保持关。
-        let mut settings = store.load().unwrap();
-        settings.restore_on_exit = false;
-        store.save(&settings).unwrap();
+        // 版本 4 之前的文件总会写出 true（开发版的默认值），读的时候迁移成关。
+        std::fs::write(&store.path, r#"{"version":3,"restoreOnExit":true}"#).unwrap();
         assert!(!store.load().unwrap().restore_on_exit);
+        std::fs::write(&store.path, r#"{"bindings":{}}"#).unwrap();
+        assert!(!store.load().unwrap().restore_on_exit);
+        // 迁移后用户再打开：存成版本 4，之后保持开。
+        let mut settings = store.load().unwrap();
+        settings.restore_on_exit = true;
+        store.save(&settings).unwrap();
+        assert!(store.load().unwrap().restore_on_exit);
     }
 
     #[test]

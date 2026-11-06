@@ -1,4 +1,4 @@
-//! 网关模式端到端：真实 helper + 模拟上游，覆盖 Claude Code / Grok 经网关的完整链路。
+//! 网关模式端到端：真实 helper + 模拟上游，覆盖 Claude Code / Grok / 通用 Agent（Chat、Gemini 入站）经网关的完整链路。
 //!
 //! 常驻 helper 是进程级单例、状态目录靠进程级环境变量覆盖，所以全部场景放在一个测试里顺序执行。
 
@@ -143,9 +143,13 @@ fn providers(relays: Vec<RelayProfile>) -> Vec<GatewayProvider> {
             model_windows: Default::default(),
             context_window: None,
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
+            newapi_access: None,
+            upstream_meta: Default::default(),
             relay,
             extra: Default::default(),
         })
@@ -192,11 +196,17 @@ fn claude_request(stream: bool) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_end_to_end() {
     let state_dir = tempfile::tempdir().unwrap();
+    let codex_home = state_dir.path().join("codex-home");
+    let sqlite_home = state_dir.path().join("codex-sqlite");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::create_dir_all(&sqlite_home).unwrap();
     unsafe {
         std::env::set_var(
             codex_plus_core::paths::STATE_DIR_ENV,
             state_dir.path().to_str().unwrap(),
         );
+        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var("CODEX_SQLITE_HOME", &sqlite_home);
     }
     let port = {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -391,6 +401,37 @@ async fn gateway_end_to_end() {
         assert_eq!(body["model"], "gpt-up");
         assert_eq!(body["instructions"], "You are Claude Code.");
         assert_eq!(body["store"], false);
+    }
+
+    // —— 3b. Claude 系请求的档位套到上游模型实有的档位 ——
+    let fit_body = json!({
+        "id": "resp_fit", "object": "response", "status": "completed", "model": "gpt-up",
+        "output": [{ "id": "msg_fit", "type": "message", "role": "assistant", "status": "completed",
+                     "content": [{ "type": "output_text", "text": "档位", "annotations": [] }] }],
+        "usage": { "input_tokens": 5, "output_tokens": 1 }
+    })
+    .to_string();
+    for (levels, expected) in [
+        (r#"[{"effort":"low"},{"effort":"medium"},{"effort":"high"}]"#, "high"),
+        (
+            r#"[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]"#,
+            "xhigh",
+        ),
+    ] {
+        let (fit_base, fit_seen) =
+            mock_upstream(vec![(200, "application/json", fit_body.clone())]).await;
+        let mut fit_relay = relay("fit", &fit_base, "sk-fit", RelayProtocol::Responses, "gpt-up");
+        fit_relay.model_metadata =
+            format!(r#"{{"gpt-up":{{"supported_reasoning_levels":{levels}}}}}"#);
+        gateway.providers = providers(vec![fit_relay]);
+        save(&gateway);
+        let mut request = claude_request(false);
+        request["thinking"] = json!({ "type": "adaptive" });
+        request["output_config"] = json!({ "effort": "max" });
+        let (status, text) = post(port, "/gw/claude/v1/messages", token, &request).await;
+        assert_eq!(status, 200, "{text}");
+        let seen = fit_seen.lock().unwrap();
+        assert_eq!(seen[0].1["reasoning"]["effort"], expected, "levels: {levels}");
     }
 
     // —— 4. Anthropic 上游原样转发 ——
@@ -636,6 +677,49 @@ async fn gateway_end_to_end() {
         .map(|model| model["id"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(ids, vec!["group/group", "deepseek-v4-pro", "glm-5.3"]);
+
+    // Claude Desktop：非 Claude 模型换成数字别名，真实名字在 display_name 里。
+    gateway.bindings.insert(
+        "claude-desktop".into(),
+        binding("deepseek-v4-pro", "cpx-gw-desktop-e2e"),
+    );
+    save(&gateway);
+    let models = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/gw/claude-desktop/v1/models"))
+        .bearer_auth("cpx-gw-desktop-e2e")
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let rows = models["data"].as_array().unwrap();
+    let names = rows
+        .iter()
+        .map(|row| row["display_name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["deepseek-v4-pro", "glm-5.3", "group/group"]);
+    for row in rows {
+        let real = row["display_name"].as_str().unwrap();
+        let id = row["id"].as_str().unwrap();
+        // 有思考档位的模型用 mythos-gw- 别名（Desktop 才出思考等级菜单），其余仍是 claude-gw-；
+        // 数字部分与旧别名一致，旧会话选中的模型照样能还原。
+        let old = codex_plus_core::gateway::route::claude_alias(real);
+        let digits = old.strip_prefix("claude-gw-").unwrap();
+        assert!(
+            id == old || id == format!("mythos-gw-{digits}"),
+            "{real}: {id}"
+        );
+        assert_eq!(
+            id,
+            codex_plus_core::gateway::route::claude_desktop_alias(
+                real,
+                id.starts_with("mythos-gw-")
+            )
+        );
+    }
+    gateway.bindings.remove("claude-desktop");
+    save(&gateway);
 
     // —— 8. Grok：Responses 客户端 → Chat 上游，输出 Responses 事件流 ——
     let (grok_base, grok_seen) =
@@ -941,6 +1025,233 @@ async fn gateway_end_to_end() {
     assert_eq!(codex_entries.len(), 1, "{codex_entries:?}");
     assert_eq!(codex_entries[0].agent.as_deref(), Some("codex"));
 
+    // —— 8d2. #2783：Codex 的客户端标识（UA、originator、x-codex-*）经网关原样带给 Responses 上游，
+    //         直接访问网关、以 ChatGPT 身份经本地代理转进网关两条路都一样 ——
+    let codex_ua = "codex_cli_rs/0.165.0 (Windows 10.0.26100; x86_64) WindowsTerminal";
+    let responses_json = json!({
+        "id": "resp_e2e", "object": "response", "status": "completed", "model": "gpt-up",
+        "output": [{ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "ok" }] }]
+    })
+    .to_string();
+    let (identity_base, identity_seen) =
+        mock_upstream(vec![(200, "application/json", responses_json)]).await;
+    gateway.providers = providers(vec![relay(
+        "sub2api",
+        &identity_base,
+        "sk-sub2api",
+        RelayProtocol::Responses,
+        "glm-5.3",
+    )]);
+    save(&gateway);
+    let codex_body = json!({
+        "model": "glm-5.3",
+        "instructions": "You are Codex.",
+        "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }]
+    });
+    for (url, auth) in [
+        (
+            format!("http://127.0.0.1:{port}/gw/codex/v1/responses"),
+            "cpx-gw-codex-e2e",
+        ),
+        (
+            format!("http://127.0.0.1:{port}/v1/responses"),
+            "chatgpt-access-token",
+        ),
+    ] {
+        let response = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(auth)
+            .header("user-agent", codex_ua)
+            .header("originator", "codex_cli_rs")
+            .header("x-codex-window-id", "win-2783:0")
+            .header("x-codex-turn-metadata", "{\"turn_id\":\"t-2783\"}")
+            .header("x-codex-beta-features", "remote_compaction_v2")
+            .header("x-codex-turn-state", "sticky-from-elsewhere")
+            .header("cookie", "secret=1")
+            .header("session-id", "codex-session-2783")
+            .json(&codex_body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let response_body = response.text().await.unwrap();
+        assert_eq!(status, 200, "{url}: {response_body}");
+        let seen = identity_seen.lock().unwrap();
+        let (head, _) = seen.last().unwrap();
+        let head = head.to_ascii_lowercase();
+        for expected in [
+            format!("user-agent: {}", codex_ua.to_ascii_lowercase()),
+            "originator: codex_cli_rs".to_string(),
+            "x-codex-window-id: win-2783:0".to_string(),
+            "x-codex-turn-metadata: {\"turn_id\":\"t-2783\"}".to_string(),
+            "x-codex-beta-features: remote_compaction_v2".to_string(),
+            "session-id: codex-session-2783".to_string(),
+            "authorization: bearer sk-sub2api".to_string(),
+        ] {
+            assert!(head.contains(&expected), "{url} 缺 {expected}：{head}");
+        }
+        for leaked in [
+            "x-codex-turn-state",
+            "cookie:",
+            "cpx-gw-codex-e2e",
+            "chatgpt-access-token",
+        ] {
+            assert!(!head.contains(leaked), "{url} 不该带 {leaked}：{head}");
+        }
+        assert_eq!(head.matches("originator:").count(), 1, "{head}");
+    }
+    assert_eq!(identity_seen.lock().unwrap().len(), 2);
+    assert!(
+        state_dir
+            .path()
+            .join("gateway-subagent-models.sqlite")
+            .is_file()
+    );
+
+    let saved_gateway = gateway.clone();
+    let fake_response = json!({
+        "id": "resp_inheritance", "object": "response", "status": "completed",
+        "model": "gpt-6.1-sol", "output": []
+    })
+    .to_string();
+    let (first_base, first_seen) =
+        mock_upstream(vec![(200, "application/json", fake_response.clone())]).await;
+    let (second_base, second_seen) =
+        mock_upstream(vec![(200, "application/json", fake_response)]).await;
+    gateway.providers = providers(vec![
+        relay(
+            "inherit-a",
+            &first_base,
+            "fake-a",
+            RelayProtocol::Responses,
+            "gpt-6.1-sol\ngpt-6.1-terra",
+        ),
+        relay(
+            "inherit-b",
+            &second_base,
+            "fake-b",
+            RelayProtocol::Responses,
+            "gpt-6.1-sol\ngpt-6.1-terra",
+        ),
+    ]);
+    gateway.bindings.get_mut("codex").unwrap().model = "inherit-a/gpt-6.1-sol".into();
+    save(&gateway);
+    for (index, (url, auth)) in [
+        (
+            format!("http://127.0.0.1:{port}/gw/codex/v1/responses"),
+            "cpx-gw-codex-e2e",
+        ),
+        (
+            format!("http://127.0.0.1:{port}/v1/responses"),
+            "chatgpt-access-token",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parent = format!("inherit-parent-{index}");
+        let child = format!("inherit-child-{index}");
+        for (thread, model, parent_thread) in [
+            (parent.as_str(), "inherit-b/gpt-6.1-terra", None),
+            (child.as_str(), "gpt-6.1-sol", Some(parent.as_str())),
+        ] {
+            let metadata = json!({"thread_id":thread,"turn_id":"turn", "parent_thread_id":parent_thread.unwrap_or(""), "parent_turn_id":if parent_thread.is_some() { "turn" } else { "" }});
+            let mut request = reqwest::Client::new()
+                .post(&url)
+                .bearer_auth(auth)
+                .header("session-id", thread)
+                .header("x-codex-turn-metadata", metadata.to_string())
+                .json(&json!({"model":model,"input":[]}));
+            if let Some(parent_thread) = parent_thread {
+                request = request
+                    .header("x-codex-parent-thread-id", parent_thread)
+                    .header("x-openai-subagent", "collab_spawn");
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert_eq!(status.as_u16(), 200, "{url}: {body}");
+        }
+    }
+    assert!(first_seen.lock().unwrap().is_empty());
+    {
+        let seen = second_seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert!(
+            seen.iter()
+                .all(|(_, body)| body["model"] == "gpt-6.1-terra")
+        );
+    }
+    let explicit_response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/gw/codex/v1/responses"))
+        .bearer_auth("cpx-gw-codex-e2e")
+        .header("session-id", "explicit-child")
+        .header("x-codex-parent-thread-id", "inherit-parent-0")
+        .header("x-openai-subagent", "collab_spawn")
+        .header("x-codex-turn-metadata", json!({"thread_id":"explicit-child","turn_id":"turn","parent_thread_id":"inherit-parent-0","parent_turn_id":"turn"}).to_string())
+        .json(&json!({"model":"inherit-a/gpt-6.1-sol","input":[]}))
+        .send().await.unwrap();
+    assert_eq!(explicit_response.status().as_u16(), 200);
+    assert_eq!(
+        first_seen.lock().unwrap().last().unwrap().1["model"],
+        "gpt-6.1-sol"
+    );
+    gateway.groups = vec![GatewayGroup {
+        id: "inherit-group".into(),
+        name: "inherit-group".into(),
+        mode: GroupMode::Manual,
+        members: vec![
+            GroupMember {
+                model: "inherit-a/gpt-6.1-sol".into(),
+                weight: 1,
+            },
+            GroupMember {
+                model: "inherit-b/gpt-6.1-terra".into(),
+                weight: 1,
+            },
+        ],
+        pick: "inherit-b/gpt-6.1-terra".into(),
+        ..Default::default()
+    }];
+    save(&gateway);
+    for (thread, model, parent) in [
+        ("group-parent", "group/inherit-group", None),
+        ("group-child", "gpt-6.1-sol", Some("group-parent")),
+    ] {
+        if parent.is_some() {
+            gateway.groups[0].pick = "inherit-a/gpt-6.1-sol".into();
+            save(&gateway);
+        }
+        let metadata = json!({"thread_id":thread,"turn_id":"turn", "parent_thread_id":parent.unwrap_or(""), "parent_turn_id":if parent.is_some() { "turn" } else { "" }});
+        let mut request = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/gw/codex/v1/responses"))
+            .bearer_auth("cpx-gw-codex-e2e")
+            .header("session-id", thread)
+            .header("x-codex-turn-metadata", metadata.to_string())
+            .json(&json!({"model":model,"input":[]}));
+        if let Some(parent) = parent {
+            request = request
+                .header("x-codex-parent-thread-id", parent)
+                .header("x-openai-subagent", "collab_spawn");
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status.as_u16(), 200, "{thread}: {body}");
+    }
+    assert_eq!(first_seen.lock().unwrap().len(), 2);
+    assert_eq!(second_seen.lock().unwrap().len(), 5);
+    assert_eq!(
+        first_seen.lock().unwrap().last().unwrap().1["model"],
+        "gpt-6.1-sol"
+    );
+    assert_eq!(
+        second_seen.lock().unwrap().last().unwrap().1["model"],
+        "gpt-6.1-terra"
+    );
+    gateway = saved_gateway;
+    save(&gateway);
+
     // —— 8e. 生图：自动选池里的生图模型，第一家 5xx 换下一家，请求里的模型名换成那一家的 ——
     let (bad_base, _) = mock_upstream(vec![(
         500,
@@ -1001,8 +1312,36 @@ async fn gateway_end_to_end() {
         assert_eq!(body["model"], "flux-1-schnell");
         assert_eq!(body["prompt"], "a cat");
     }
+    // 生图也记进请求日志：类型、Agent、最后回答的那家、试了几家。
+    let mut image_entry = None;
+    for _ in 0..40 {
+        let log =
+            std::fs::read_to_string(state_dir.path().join("request-log.jsonl")).unwrap_or_default();
+        image_entry = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|entry| {
+                entry["wire_api"] == "imageGenerations" || entry["wireApi"] == "imageGenerations"
+            });
+        if image_entry.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let image_entry = image_entry.expect("生图请求要记进请求日志");
+    let field = |snake: &str, camel: &str| {
+        image_entry
+            .get(snake)
+            .or_else(|| image_entry.get(camel))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(field("agent", "agent"), "grok");
+    assert_eq!(field("relay_id", "relayId"), "painter");
+    assert_eq!(field("attempts", "attempts"), 2);
+    assert_eq!(field("success", "success"), true);
     // 关掉生图：直接报错，不发给上游。
-    gateway.image_model = "off".into();
+    gateway.image_models.insert("grok".into(), "off".into());
     save(&gateway);
     let response = reqwest::Client::new()
         .post(format!(
@@ -1015,7 +1354,205 @@ async fn gateway_end_to_end() {
         .unwrap();
     assert_eq!(response.status().as_u16(), 400);
     assert!(response.text().await.unwrap().contains("生图已关闭"));
-    gateway.image_model = String::new();
+    gateway.image_models.clear();
+
+    // Codex 以 ChatGPT 身份接入（8d 里 Codex 的供应商已是网关托管的那个）：它的生图请求打到本地代理的
+    // `/v1/images/generations`，也要按 Codex 的生图模型走网关，不能按直连转回本地代理自己。
+    let (codex_image_base, codex_image_seen) = mock_upstream(vec![(
+        200,
+        "application/json",
+        json!({ "data": [{ "b64_json": "BBBB" }] }).to_string(),
+    )])
+    .await;
+    gateway.providers = providers(vec![
+        relay(
+            "chatonly",
+            &grok_base,
+            "sk-grok",
+            RelayProtocol::ChatCompletions,
+            "glm-5.3",
+        ),
+        relay(
+            "painter",
+            &codex_image_base,
+            "sk-paint",
+            RelayProtocol::Responses,
+            "gpt-image-2",
+        ),
+    ]);
+    save(&gateway);
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/images/generations"))
+        .bearer_auth("chatgpt-access-token")
+        .json(&json!({ "model": "gpt-image-2", "prompt": "a cat" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(response.text().await.unwrap().contains("BBBB"));
+    {
+        let seen = codex_image_seen.lock().unwrap();
+        let (head, body) = &seen[0];
+        assert!(head.starts_with("POST /v1/images/generations"), "{head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("authorization: bearer sk-paint"),
+            "{head}"
+        );
+        assert_eq!(body["model"], "gpt-image-2");
+    }
+
+    // —— 8f. 通用 Agent（OpenCode）：Chat Completions 与 Gemini 入站都经网关转给 Chat 上游 ——
+    let (generic_base, generic_seen) = mock_upstream(vec![
+        (200, "text/event-stream", chat_sse("通用流式")),
+        (
+            200,
+            "application/json",
+            json!({
+                "id": "c9", "object": "chat.completion", "model": "up",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "通用整段" }, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12 }
+            })
+            .to_string(),
+        ),
+        (200, "text/event-stream", chat_tool_sse()),
+        (200, "text/event-stream", chat_sse("双子座")),
+    ])
+    .await;
+    gateway.providers = providers(vec![relay(
+        "generic",
+        &generic_base,
+        "sk-generic",
+        RelayProtocol::ChatCompletions,
+        "deepseek-v4-pro",
+    )]);
+    let generic_token = "cpx-gw-opencode-e2e";
+    gateway.bindings.insert(
+        "opencode".into(),
+        binding("deepseek-v4-pro", generic_token),
+    );
+    save(&gateway);
+    let chat_body = |stream: bool| {
+        json!({
+            "model": "generic/deepseek-v4-pro",
+            "stream": stream,
+            "stream_options": { "include_usage": true },
+            "messages": [
+                { "role": "system", "content": "你是助手" },
+                { "role": "user", "content": "你好" }
+            ],
+            "tools": [{ "type": "function", "function": { "name": "Bash", "parameters": { "type": "object", "properties": { "command": { "type": "string" } } } } }]
+        })
+    };
+    // 流式：标准 chat.completion.chunk，带 usage 块和 [DONE]。
+    let (status, text) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        generic_token,
+        &chat_body(true),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    let chunks = sse_events(&text);
+    let streamed: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(streamed, "通用流式");
+    assert!(
+        chunks.iter().any(|chunk| chunk["usage"]["total_tokens"].as_u64() == Some(25)),
+        "{text}"
+    );
+    {
+        let seen = generic_seen.lock().unwrap();
+        let (_, body) = &seen[0];
+        assert_eq!(body["model"], "deepseek-v4-pro");
+        assert_eq!(body["tools"][0]["function"]["name"], "Bash");
+    }
+    // 非流式：完整 chat.completion。
+    let (status, text) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        generic_token,
+        &chat_body(false),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let completion: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(completion["object"], "chat.completion");
+    assert_eq!(completion["choices"][0]["message"]["content"], "通用整段");
+    // 工具调用：tool_calls 增量、finish_reason = tool_calls。
+    let (status, text) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        generic_token,
+        &chat_body(true),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let chunks = sse_events(&text);
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "Bash"),
+        "{text}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["finish_reason"] == "tool_calls"),
+        "{text}"
+    );
+    // Gemini：模型名带 `/`，Key 放在查询串里，流式回 GenerateContentResponse。
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/gw/opencode/v1beta/models/generic/deepseek-v4-pro:streamGenerateContent?alt=sse&key={generic_token}"
+        ))
+        .json(&json!({
+            "systemInstruction": { "parts": [{ "text": "你是助手" }] },
+            "contents": [{ "role": "user", "parts": [{ "text": "你好" }] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let text = response.text().await.unwrap();
+    let gemini_text: String = text
+        .split("\r\n\r\n")
+        .flat_map(|block| block.split("\n\n"))
+        .filter_map(|block| block.trim().strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .filter_map(|event| {
+            event["candidates"][0]["content"]["parts"][0]["text"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(gemini_text, "双子座", "{text}");
+    // Gemini 本地计数，不发上游。
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/gw/opencode/v1beta/models/generic/deepseek-v4-pro:countTokens"
+        ))
+        .header("x-goog-api-key", generic_token)
+        .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "你好" }] }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let counted: Value = response.json().await.unwrap();
+    assert!(counted["totalTokens"].as_u64().unwrap() > 0);
+    assert_eq!(generic_seen.lock().unwrap().len(), 4, "countTokens 不该发给上游");
+    // token 不对：401，OpenAI 风格的错误。
+    let (status, _) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        "wrong",
+        &chat_body(true),
+    )
+    .await;
+    assert_eq!(status, 401);
 
     // —— 9. 关闭绑定后返回 503，旧的 Codex 代理路径不受影响 ——
     gateway.bindings.get_mut("claude").unwrap().enabled = false;

@@ -7,14 +7,21 @@ const { chromium } = require("playwright");
 const sharp = require("sharp");
 const { PNG } = require("pngjs");
 const repo = path.resolve(__dirname, "..");
+// 背景图引擎现在在官方拓展包里（assets/extensions/image-overlay/overlay.js）；拆包之前的基线在 renderer-inject.js 里。
+const engineFile = "assets/extensions/image-overlay/overlay.js";
+const legacyFile = "assets/inject/renderer-inject.js";
+const atBaseline = file => execFileSync("git", ["show", process.env.CODEX_OVERLAY_BASELINE + ":" + file],
+  { cwd: repo, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
 const source = process.env.CODEX_OVERLAY_CANDIDATE_FUNCTION
   ? fs.readFileSync(process.env.CODEX_OVERLAY_CANDIDATE_FUNCTION, "utf8")
   : process.env.CODEX_OVERLAY_BASELINE
-  ? execFileSync("git", ["show", process.env.CODEX_OVERLAY_BASELINE + ":assets/inject/renderer-inject.js"],
-    { cwd: repo, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 })
-  : fs.readFileSync(path.join(repo, "assets/inject/renderer-inject.js"), "utf8");
+  ? (() => { try { return atBaseline(engineFile); } catch { return atBaseline(legacyFile); } })()
+  : fs.readFileSync(path.join(repo, engineFile), "utf8");
 const install = source.match(/^  function installCodexPlusImageOverlay\([^]*?^  \}/m)[0];
-const injection = 'const codexPlusImageOverlayId="codex-plus-image-overlay";const sendCodexPlusDiagnostic=()=>{};' + install;
+// 拓展里的引擎收 config 参数，旧基线读 window.__CODEX_PLUS_IMAGE_OVERLAY__：包一层，两种都用这个全局配置驱动。
+const injection = 'const codexPlusImageOverlayId="codex-plus-image-overlay";const sendCodexPlusDiagnostic=()=>{};'
+  + install.replace("function installCodexPlusImageOverlay(", "function codexPlusImageOverlayEngine(")
+  + ";function installCodexPlusImageOverlay(config){return codexPlusImageOverlayEngine(config ?? window.__CODEX_PLUS_IMAGE_OVERLAY__ ?? {});}";
 const assets = {};
 let browser, started = false;
 const bitmap = async color => "data:image/png;base64," + (await sharp({
@@ -119,7 +126,7 @@ function check(name, run, viewport = { width: 800, height: 600 }, pageOptions = 
       await run(page);
       assert.deepEqual(errors, []);
       await page.evaluate(() => window.__codexPlusImageOverlayCleanup?.());
-      assert.equal(await page.locator('[data-codex-plus-ext="image-overlay"],[data-codex-plus-image-native],[data-codex-plus-image-control],[data-codex-plus-image-scope],[data-codex-plus-image-paint],[data-codex-plus-image-popup-material],[data-codex-plus-image-top-control],[data-codex-plus-image-footer-gutter]').count(), 0);
+      assert.equal(await page.locator('[data-codex-plus-ext="image-overlay"],[data-codex-plus-image-native],[data-codex-plus-image-control],[data-codex-plus-image-scope],[data-codex-plus-image-paint],[data-codex-plus-image-popup-material],[data-codex-plus-image-top-control],[data-codex-plus-image-popup-portal],[data-codex-plus-image-footer-gutter]').count(), 0);
       assert.equal(await page.evaluate(() => window.resizeTargets.size), 0);
       assert.equal(await page.evaluate(() => window.intersectionTargets.size), 0);
       assert.ok(await page.evaluate(() => Element.prototype.animate === window.nativeAnimate &&

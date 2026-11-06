@@ -170,6 +170,26 @@ fn jwt_claims(token: &str) -> Option<Value> {
     serde_json::from_slice(&decoded).ok()
 }
 
+/// access token 的签发时间（JWT `iat`，Unix 秒）。
+fn jwt_iat_secs(token: &str) -> Option<u64> {
+    jwt_claims(token)?.get("iat")?.as_u64()
+}
+
+fn has_last_refresh(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("last_refresh")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// `last_refresh` 的 RFC 3339 时间戳：给了签发时间用它，否则用现在。
+pub(crate) fn last_refresh_stamp(issued_at_secs: Option<u64>) -> String {
+    match issued_at_secs {
+        Some(secs) => crate::extension_curation::utc_iso(secs),
+        None => crate::extension_curation::now_iso(),
+    }
+}
+
 fn jwt_exp_ms(token: &str) -> Option<i64> {
     jwt_claims(token)?
         .get("exp")?
@@ -388,15 +408,24 @@ pub fn auth_contents_with_member_login(
     object
         .entry("auth_mode".to_string())
         .or_insert_with(|| json!("chatgpt"));
-    // 刷新时间戳也带上：成员快照里的 `last_refresh` 是它最后刷新的时间，缺了 Codex
-    // 会按"从未刷新"处理。已存在（live 里的）不覆盖。
-    if !object.contains_key("last_refresh")
+    // 刷新时间戳也带上：成员快照里的 `last_refresh` 是它最后刷新的时间。已存在（live 里的）不覆盖。
+    if !has_last_refresh(&object)
         && let Some(last_refresh) = serde_json::from_str::<Value>(member_auth_contents)
             .ok()
             .and_then(|value| value.get("last_refresh").cloned())
         && !last_refresh.is_null()
     {
         object.insert("last_refresh".to_string(), last_refresh);
+    }
+    // 成员快照也没有时（网关自己登录的账号旧版不写这个字段）补一个：Codex 26.1029 起缺
+    // `last_refresh` 时 getAuthStatus 报 `Token data is not available`，启动即弹登录页（#2890）。
+    if !has_last_refresh(&object) {
+        let issued_at = object
+            .get("tokens")
+            .and_then(|tokens| tokens.get("access_token"))
+            .and_then(Value::as_str)
+            .and_then(jwt_iat_secs);
+        object.insert("last_refresh".to_string(), json!(last_refresh_stamp(issued_at)));
     }
     Some(format!(
         "{}\n",
@@ -543,7 +572,9 @@ async fn resolve_official_credential_with(
     let token_url = token_url_override
         .map(str::to_string)
         .unwrap_or_else(oauth_token_url);
-    let refreshed = match refresh_codex_tokens(&token_url, &login.refresh_token).await {
+    let proxy = token_refresh_proxy(profile);
+    let proxy = proxy.as_deref();
+    let refreshed = match refresh_codex_tokens(&token_url, &login.refresh_token, proxy).await {
         Ok(tokens) => tokens,
         Err(error) => {
             // live 里可能是更新一代的 refresh token：换它再试一次。
@@ -552,7 +583,7 @@ async fn resolve_official_credential_with(
             });
             match live {
                 Some(live) if live.account_id == login.account_id => {
-                    match refresh_codex_tokens(&token_url, &live.refresh_token).await {
+                    match refresh_codex_tokens(&token_url, &live.refresh_token, proxy).await {
                         Ok(tokens) => tokens,
                         Err(retry_error) => {
                             mark_refresh_failure(&account_key);
@@ -613,14 +644,26 @@ fn current_auth_contents(store: &SettingsStore, profile_id: &str) -> Option<Stri
         .map(|profile| profile.auth_contents.clone())
 }
 
+/// 官方登录 token 刷新用的代理。网关供应商（`gateway_proxy` 为 Some）的刷新属于这个供应商，
+/// 按它自己的代理设置发，没开系统代理时也能刷新（#2775）。直连模式的纯官方登录不走独立代理
+/// （与 [`RelayProfile::uses_independent_proxy`] 一致），不读残留的按 id 代理表或
+/// `CODEX_PLUS_PROXY`，保持原来的 reqwest 默认行为（系统代理 / 代理环境变量）。
+fn token_refresh_proxy(profile: &RelayProfile) -> Option<String> {
+    profile.gateway_proxy.as_ref()?;
+    crate::relay_proxy::proxy_for_relay(profile)
+}
+
 async fn refresh_codex_tokens(
     token_url: &str,
     refresh_token: &str,
+    proxy: Option<&str>,
 ) -> anyhow::Result<RefreshedTokens> {
-    let client = reqwest::Client::builder()
-        .user_agent(format!("CodexPlusPlus/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let client = crate::http_client::build_with_relay_proxy(
+        reqwest::Client::builder()
+            .user_agent(format!("CodexPlusPlus/{}", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(30)),
+        proxy,
+    )?;
     let response = client
         .post(token_url)
         .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -717,6 +760,8 @@ fn auth_with_tokens(
     if !account_id.trim().is_empty() {
         value["tokens"]["account_id"] = serde_json::json!(account_id);
     }
+    // 刚刷新过：同步刷新时间戳，Codex 据此判断登录态是否可用（#2890）。
+    value["last_refresh"] = serde_json::json!(last_refresh_stamp(None));
     Ok(serde_json::to_string_pretty(&value)?)
 }
 
@@ -747,8 +792,8 @@ pub(crate) fn persist_gateway_login(
     refresh_token: &str,
     account_id: &str,
 ) {
-    let result = (|| -> anyhow::Result<()> {
-        let mut gateway = store.load()?;
+    // 带锁读改写：界面命令同时改 gateway.json 时不会拿旧状态整体覆盖，也不会被它覆盖。
+    let result = store.update(|gateway| {
         let Some(provider) = gateway
             .providers
             .iter_mut()
@@ -762,8 +807,8 @@ pub(crate) fn persist_gateway_login(
             refresh_token,
             account_id,
         )?;
-        store.save(&gateway)
-    })();
+        Ok(())
+    });
     if let Err(error) = result {
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "official_login.gateway_refresh_persist_failed",
@@ -827,6 +872,78 @@ mod tests {
             auth_contents: auth_contents.to_string(),
             ..RelayProfile::default()
         }
+    }
+
+    /// 直连模式的纯官方登录：即使按 id 代理表里残留了这个供应商的代理，token 刷新也不套用；
+    /// 网关供应商才按它自己的代理设置（含「直连」）刷新。
+    #[test]
+    fn token_refresh_proxy_applies_only_to_gateway_providers() {
+        let temp = tempfile::tempdir().unwrap();
+        let _scope = crate::relay_proxy::ProxyPathTestScope::new(temp.path());
+        crate::relay_proxy::set_proxy_for_profile("official", "http://127.0.0.1:9").unwrap();
+        let mut profile = official_profile("{}");
+        assert_eq!(
+            crate::relay_proxy::configured_proxy_for_profile("official").as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+        assert!(!profile.uses_independent_proxy());
+        assert_eq!(token_refresh_proxy(&profile), None);
+
+        profile.gateway_proxy = Some("http://127.0.0.1:8".to_string());
+        assert_eq!(
+            token_refresh_proxy(&profile).as_deref(),
+            Some("http://127.0.0.1:8")
+        );
+        profile.gateway_proxy = Some(crate::relay_proxy::DIRECT_PROXY.to_string());
+        assert_eq!(
+            token_refresh_proxy(&profile).as_deref(),
+            Some(crate::relay_proxy::DIRECT_PROXY)
+        );
+    }
+
+    /// #2890：网关自己登录的账号快照没有 `last_refresh`，借给 Codex 时要补上，
+    /// 否则 Codex 26.1029 报 `Token data is not available`、启动即弹登录页。
+    #[test]
+    fn lending_member_without_last_refresh_backfills_it_from_token_iat() {
+        let access = fake_jwt(json!({ "iat": 1_793_750_400u64, "exp": 1_794_614_400u64 }));
+        let member = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": "id",
+                "access_token": access,
+                "refresh_token": "r",
+                "account_id": "acct-1"
+            }
+        })
+        .to_string();
+        let merged = auth_contents_with_member_login(r#"{"OPENAI_API_KEY":"cpx-gw"}"#, &member, false)
+            .expect("成员有凭据时应写出 auth.json");
+        let auth: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(auth["last_refresh"], "2026-11-04T00:00:00.000Z", "{auth}");
+        assert_eq!(auth["auth_mode"], "chatgpt");
+        assert_eq!(auth["OPENAI_API_KEY"], "cpx-gw");
+    }
+
+    #[test]
+    fn member_last_refresh_is_kept_when_present() {
+        let member = json!({
+            "tokens": { "access_token": "a", "refresh_token": "r", "account_id": "acct-1" },
+            "last_refresh": "2026-10-01T00:00:00Z"
+        })
+        .to_string();
+        let merged = auth_contents_with_member_login("{}", &member, false).unwrap();
+        let auth: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(auth["last_refresh"], "2026-10-01T00:00:00Z");
+    }
+
+    #[test]
+    fn refreshed_tokens_stamp_last_refresh() {
+        let updated = auth_with_tokens(r#"{"auth_mode":"chatgpt","tokens":{}}"#, "a2", "r2", "acct-1").unwrap();
+        let auth: Value = serde_json::from_str(&updated).unwrap();
+        assert!(
+            auth["last_refresh"].as_str().is_some_and(|stamp| stamp.ends_with('Z')),
+            "{auth}"
+        );
     }
 
     #[test]
@@ -997,5 +1114,95 @@ mod tests {
         let login = official_login_from_auth_contents(&persisted.auth_contents).unwrap();
         assert_eq!(login.access_token, "fresh-access");
         assert_eq!(login.refresh_token, "fresh-refresh");
+    }
+
+    /// #2775：供应商单独填了（带用户名密码的）HTTP 代理时，官方登录的 token 刷新要经过它，
+    /// 不能只看系统代理，否则没开系统代理时刷新直连 OpenAI 失败。
+    #[tokio::test]
+    async fn token_refresh_goes_through_the_relays_own_proxy() {
+        use base64::Engine;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // 本地「代理」：收下第一条请求原样记录，再替上游回刷新结果。
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 8192];
+            let mut request = Vec::new();
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n")
+                    && String::from_utf8_lossy(&request).contains("grant_type=refresh_token")
+                {
+                    break;
+                }
+            }
+            let body = r#"{"access_token":"proxied-access","refresh_token":"proxied-refresh"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request).to_string()
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let expired = fake_jwt(json!({ "exp": now_ms() / 1000 - 60 }));
+        let mut profile = official_profile(
+            &json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": expired,
+                    "refresh_token": "proxy-refresh",
+                    "account_id": "acct-proxy-2775"
+                }
+            })
+            .to_string(),
+        );
+        // 密码里的 @ 按 URL 规则写成 %40，代理认证时要还原。
+        profile.gateway_proxy = Some(format!("http://user-2775:p%40ss@{address}"));
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.relay_profiles = vec![profile.clone()];
+        store.save(&settings).unwrap();
+
+        // 上游是个解析不了的域名：不经过代理就到不了。
+        let credential = resolve_official_credential_with(
+            &profile,
+            false,
+            &store,
+            temp.path(),
+            Some("http://auth.codex-plus-2775.invalid/oauth/token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(credential.access_token, "proxied-access");
+
+        let request = proxy.join().unwrap();
+        assert!(
+            request.starts_with("POST http://auth.codex-plus-2775.invalid/oauth/token "),
+            "{request}"
+        );
+        let expected_auth = format!(
+            "basic {}",
+            base64::engine::general_purpose::STANDARD.encode("user-2775:p@ss")
+        );
+        assert!(
+            request.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("proxy-authorization")
+                        && value.trim().eq_ignore_ascii_case(&expected_auth)
+                })
+            }),
+            "{request}"
+        );
+        assert!(request.contains("refresh_token=proxy-refresh"), "{request}");
     }
 }

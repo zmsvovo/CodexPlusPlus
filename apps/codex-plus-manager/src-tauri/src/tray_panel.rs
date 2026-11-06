@@ -18,6 +18,9 @@ const WIDTH: f64 = 380.0;
 const HEIGHT: f64 = 540.0;
 /// 面板与托盘图标之间的间距（逻辑像素）。
 const GAP: f64 = 6.0;
+/// macOS 上面板的圆角半径（逻辑像素），和菜单栏弹出面板的观感一致。
+#[cfg(target_os = "macos")]
+const CORNER_RADIUS: f64 = 12.0;
 
 /// 开关的内存缓存。托盘事件（含鼠标移入移出）很频繁，不能每次都读 gateway.json；
 /// 启动后第一次用到时读一次，之后只在设置里切换或 `refresh_tray_mode` 时更新。
@@ -104,6 +107,11 @@ pub fn hide<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// 面板因失去焦点收起的时刻。Windows 上按下托盘图标先让面板失焦收起，松开时的点击事件再来切换，
+/// 会把刚收起的面板又打开；刚因失焦收起的这次点击就当作「收起」。
+static HIDDEN_BY_BLUR_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+const BLUR_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
 fn toggle<R: Runtime>(app: &AppHandle<R>, anchor: PhysicalPosition<f64>) {
     let window = match app.get_webview_window(LABEL) {
         Some(window) => window,
@@ -116,9 +124,40 @@ fn toggle<R: Runtime>(app: &AppHandle<R>, anchor: PhysicalPosition<f64>) {
         let _ = window.hide();
         return;
     }
+    let just_hidden = HIDDEN_BY_BLUR_AT
+        .lock()
+        .ok()
+        .and_then(|mut at| at.take())
+        .is_some_and(|at| at.elapsed() < BLUR_CLICK_WINDOW);
+    if just_hidden {
+        return;
+    }
     place(&window, anchor);
     let _ = window.show();
+    round_corners(app, &window);
     let _ = window.set_focus();
+}
+
+/// 无边框窗口默认是直角；显示后裁成圆角并按新轮廓重算阴影。AppKit 调用必须在主线程。
+fn round_corners<R: Runtime>(app: &AppHandle<R>, window: &tauri::WebviewWindow<R>) {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(pointer) = window.ns_window() else {
+            return;
+        };
+        let address = pointer as usize;
+        let _ = app.run_on_main_thread(move || {
+            // SAFETY: 指针来自 Tauri 的 `ns_window()`，面板只隐藏不销毁，窗口一直有效。
+            unsafe {
+                codex_plus_core::macos_window::round_corners(
+                    address as *mut std::ffi::c_void,
+                    CORNER_RADIUS,
+                )
+            };
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, window);
 }
 
 fn create<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::WebviewWindow<R>> {
@@ -140,6 +179,11 @@ fn create<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::WebviewWindow<R>> {
     let handle = window.clone();
     window.on_window_event(move |event| {
         if let WindowEvent::Focused(false) = event {
+            if handle.is_visible().unwrap_or(false)
+                && let Ok(mut at) = HIDDEN_BY_BLUR_AT.lock()
+            {
+                *at = Some(std::time::Instant::now());
+            }
             let _ = handle.hide();
         }
     });
@@ -191,12 +235,16 @@ fn place<R: Runtime>(window: &tauri::WebviewWindow<R>, anchor: PhysicalPosition<
 }
 
 /// 面板上的按钮：打开主窗口、退出、收起。
+///
+/// 轻量模式下主窗口可能已销毁，「打开」要重建窗口：同步命令里建窗口在 Windows 上会死锁，
+/// 所以这里是异步命令，并把显示（含重建）放到主线程执行（#2677）。
 #[tauri::command]
-pub fn tray_panel_action<R: Runtime>(app: AppHandle<R>, action: String) {
+pub async fn tray_panel_action<R: Runtime>(app: AppHandle<R>, action: String) {
     match action.as_str() {
         "open" => {
             hide(&app);
-            crate::show_main_window_from(&app);
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || crate::show_main_window_from(&handle));
         }
         "quit" => {
             crate::request_app_exit(&app);
@@ -236,6 +284,8 @@ pub fn set_tray_panel_enabled<R: Runtime>(
 #[tauri::command]
 pub fn refresh_tray_mode<R: Runtime>(app: AppHandle<R>) {
     set_cached(read_enabled_from_disk());
+    // 关窗进入轻量模式的开关也存在 gateway.json，一并重读。
+    crate::lightweight::refresh_from_disk();
     apply_tray_mode(&app, crate::TRAY_ID);
     if !enabled() {
         hide(&app);

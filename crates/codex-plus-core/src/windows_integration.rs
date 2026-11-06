@@ -29,7 +29,8 @@ use windows::Win32::System::Registry::{
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE,
     PROCESS_TERMINATE, PROCESS_VM_READ, QueryFullProcessImageNameW, TerminateProcess,
     WaitForSingleObject,
 };
@@ -79,8 +80,11 @@ pub fn close_process_tree(process_id: u32, force: bool) -> bool {
     if !force {
         return request_process_close(process_id);
     }
+    use std::os::windows::process::CommandExt;
+    // taskkill 是控制台程序，不加 CREATE_NO_WINDOW 会从 GUI 进程里闪出黑色终端。
     let output = std::process::Command::new("taskkill")
         .args(["/PID", process_id.to_string().as_str(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     matches!(output, Ok(output) if output.status.success())
 }
@@ -411,6 +415,46 @@ pub fn process_birth_id(process_id: u32) -> Option<u64> {
 }
 
 #[cfg(windows)]
+pub(crate) fn process_lifetime(process_id: u32) -> anyhow::Result<Option<(u64, bool)>> {
+    process_lifetime_with(process_id, |access, pid| unsafe {
+        OpenProcess(access, false, pid)
+    })
+}
+
+#[cfg(windows)]
+fn process_lifetime_with(
+    process_id: u32,
+    open: impl FnOnce(
+        windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS,
+        u32,
+    ) -> windows::core::Result<HANDLE>,
+) -> anyhow::Result<Option<(u64, bool)>> {
+    let handle = match open(PROCESS_QUERY_LIMITED_INFORMATION, process_id) {
+        Ok(handle) => handle,
+        Err(error) if error.code().0 as u32 == 0x80070057 => return Ok(None),
+        Err(error) => {
+            return Err(std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
+                .context("无法查询进程创建身份");
+        }
+    };
+    let _guard = HandleGuard(handle);
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }
+        .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
+        .context("无法读取进程创建身份")?;
+    let birth = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+    anyhow::ensure!(birth != 0, "进程创建身份无效");
+    let mut exit_code = 0_u32;
+    unsafe { GetExitCodeProcess(handle, &mut exit_code) }
+        .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
+        .context("无法确认进程退出状态")?;
+    Ok(Some((birth, exit_code != 259)))
+}
+
+#[cfg(windows)]
 fn process_birth_id_from_handle(handle: HANDLE) -> Option<u64> {
     let mut creation_time = FILETIME::default();
     let mut exit_time = FILETIME::default();
@@ -492,54 +536,62 @@ pub(crate) fn terminate_verified_multi_worker(
     options_path: &std::path::Path,
     expected_birth: Option<u64>,
 ) -> anyhow::Result<bool> {
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
-    use windows::Win32::UI::Shell::CommandLineToArgvW;
-    if process_id == std::process::id() || expected_birth.is_none() {
-        return Ok(false);
-    }
-    let Ok(handle) = (unsafe {
-        OpenProcess(
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-            false,
-            process_id,
-        )
-    }) else {
+    let Some(process) = capture_verified_multi_worker(process_id, options_path, expected_birth)?
+    else {
         return Ok(false);
     };
-    if handle.is_invalid() {
-        return Ok(false);
-    }
-    let _guard = HandleGuard(handle);
-    let actual_birth = process_birth_id_from_handle(handle);
-    if actual_birth != expected_birth { return Ok(false); }
-    let Some(command_line) = process_command_line_from_handle(handle) else { return Ok(false); };
-    let wide = wide_null(&command_line);
-    let mut count = 0;
-    let argv = unsafe { CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count) };
-    if argv.is_null() { return Ok(false); }
-    let arguments = if count == 3 {
-        unsafe { std::slice::from_raw_parts(argv, count as usize) }.iter()
-            .map(|value| unsafe { value.to_string() }.ok()).collect::<Option<Vec<_>>>()
-    } else { None };
-    // CommandLineToArgvW 分配的 argv 必须用 LocalFree 释放。
-    unsafe { LocalFree(HLOCAL(argv.cast())) };
-    let Some(arguments) = arguments else {
-        return Ok(false);
-    };
-    if !crate::multi_worker::worker_identity_matches(
-        expected_birth,
-        actual_birth,
-        &arguments,
-        options_path,
-    ) {
-        return Ok(false);
-    }
-    let Some(image) = process_image_path_from_handle(handle) else { return Ok(false); };
-    let Ok(expected_image) = std::env::current_exe().and_then(|path| path.canonicalize())
-        else { return Ok(false); };
-    if image.canonicalize().ok().as_ref() != Some(&expected_image) { return Ok(false); }
-    unsafe { TerminateProcess(handle, 0) }.context("结束已验证的多开 worker 失败")?;
+    process.terminate()?;
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    anyhow::ensure!(
+        unsafe { WaitForSingleObject(process.native(), 5_000) } == WAIT_OBJECT_0,
+        "已验证的多开 worker 尚未确认退出"
+    );
     Ok(true)
+}
+
+#[cfg(windows)]
+fn capture_verified_multi_worker(
+    process_id: u32,
+    options_path: &std::path::Path,
+    expected_birth: Option<u64>,
+) -> anyhow::Result<Option<VerifiedStopProcess>> {
+    let expected = expected_birth
+        .filter(|birth| *birth != 0)
+        .ok_or_else(|| anyhow::anyhow!("缺少可信 worker 创建身份"))?;
+    let Some(process) = VerifiedStopProcess::capture(process_id, true)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(process.birth_id == expected, "worker 创建身份冲突");
+    if !process.is_alive()? {
+        return Ok(None);
+    }
+    let arguments = match process.arguments() {
+        Ok(arguments) => arguments,
+        Err(_) if !process.is_alive()? => return Ok(None),
+        Err(error) => return Err(error).context("无法核验 worker 参数"),
+    };
+    anyhow::ensure!(
+        crate::multi_worker::worker_identity_matches(
+            expected_birth,
+            Some(process.birth_id),
+            &arguments,
+            options_path,
+        ),
+        "worker marker 或 options 身份冲突"
+    );
+    let image = match process.image() {
+        Ok(image) => image,
+        Err(_) if !process.is_alive()? => return Ok(None),
+        Err(error) => return Err(error).context("无法核验 worker 映像"),
+    };
+    anyhow::ensure!(
+        crate::multi_worker::worker_image_matches(&image, &arguments),
+        "worker 实际映像与自身 argv[0] 冲突"
+    );
+    if !process.is_alive()? {
+        return Ok(None);
+    }
+    Ok(Some(process))
 }
 
 #[cfg(windows)]
@@ -565,61 +617,153 @@ fn command_line_arguments(command_line: &str) -> Option<Vec<String>> {
 }
 
 #[cfg(windows)]
+/// 仅解析原始 Windows argv；此 PID 查询本身不证明进程身份或代际。
 pub(crate) fn process_arguments(process_id: u32) -> Option<Vec<String>> {
     command_line_arguments(&process_command_line(process_id)?)
 }
 
-/// 命令行、创建时间、映像与终止共用同一句柄，拒绝按端口或 PID 猜测归属。
+/// 同一句柄读取 birth/image/argv/parent 并终止、等待；绝不重新按 PID 发送 kill。
 #[cfg(windows)]
-pub(crate) fn terminate_verified_codex_instance(
-    identity: &crate::multi_worker::CodexInstanceIdentity,
-) -> anyhow::Result<bool> {
-    if identity.process_id == std::process::id() || identity.process_birth_id == 0 {
-        return Ok(false);
+pub(crate) struct VerifiedStopProcess {
+    pub process_id: u32,
+    pub birth_id: u64,
+    handle: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl VerifiedStopProcess {
+    pub fn capture(process_id: u32, terminate: bool) -> anyhow::Result<Option<Self>> {
+        use std::os::windows::io::FromRawHandle;
+        anyhow::ensure!(
+            process_id != 0 && (!terminate || process_id != std::process::id()),
+            "拒绝捕获无效进程或当前 worker"
+        );
+        let rights = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_VM_READ;
+        let rights = if terminate {
+            rights | PROCESS_TERMINATE
+        } else {
+            rights
+        };
+        let native = match unsafe { OpenProcess(rights, false, process_id) } {
+            Ok(handle) => handle,
+            // ERROR_INVALID_PARAMETER 是不存在的 PID；拒绝把 ACCESS_DENIED 当成退出。
+            Err(error) if error.code().0 as u32 == 0x80070057 => return Ok(None),
+            Err(error) => return Err(error).context("无法持有多开进程句柄"),
+        };
+        let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(native.0) };
+        let birth_id = process_birth_id_from_handle(native)
+            .ok_or_else(|| anyhow::anyhow!("无法读取多开进程创建身份"))?;
+        Ok(Some(Self {
+            process_id,
+            birth_id,
+            handle,
+        }))
     }
-    let Ok(handle) = (unsafe {
-        OpenProcess(
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-            false,
-            identity.process_id,
-        )
-    }) else {
-        return Ok(false);
+
+    fn native(&self) -> HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        HANDLE(self.handle.as_raw_handle())
+    }
+
+    pub fn is_alive(&self) -> anyhow::Result<bool> {
+        use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        match unsafe { WaitForSingleObject(self.native(), 0) } {
+            WAIT_OBJECT_0 => Ok(false),
+            WAIT_TIMEOUT => Ok(true),
+            _ => Err(std::io::Error::last_os_error()).context("无法确认多开进程退出"),
+        }
+    }
+
+    pub fn image(&self) -> anyhow::Result<PathBuf> {
+        process_image_path_from_handle(self.native())
+            .ok_or_else(|| anyhow::anyhow!("无法读取多开进程映像"))
+    }
+
+    pub fn arguments(&self) -> anyhow::Result<Vec<String>> {
+        process_command_line_from_handle(self.native())
+            .and_then(|line| command_line_arguments(&line))
+            .ok_or_else(|| anyhow::anyhow!("无法读取多开进程参数"))
+    }
+
+    pub fn parent_id(&self) -> anyhow::Result<u32> {
+        let mut info: ProcessBasicInformation = unsafe { std::mem::zeroed() };
+        let mut returned = 0_u32;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                self.native(),
+                PROCESS_BASIC_INFORMATION_CLASS,
+                (&mut info as *mut ProcessBasicInformation).cast(),
+                std::mem::size_of::<ProcessBasicInformation>() as u32,
+                &mut returned,
+            )
+        };
+        anyhow::ensure!(status >= 0, "无法读取多开进程父代身份");
+        Ok(u32::try_from(info.inherited_from_unique_process_id)?)
+    }
+
+    pub fn exit_time(&self) -> anyhow::Result<u64> {
+        let mut birth = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe { GetProcessTimes(self.native(), &mut birth, &mut exit, &mut kernel, &mut user) }?;
+        Ok(((exit.dwHighDateTime as u64) << 32) | exit.dwLowDateTime as u64)
+    }
+
+    #[cfg(test)]
+    pub fn exit_code(&self) -> anyhow::Result<Option<u32>> {
+        if self.is_alive()? {
+            return Ok(None);
+        }
+        let mut code = 0;
+        unsafe { windows::Win32::System::Threading::GetExitCodeProcess(self.native(), &mut code) }?;
+        Ok(Some(code))
+    }
+
+    pub fn terminate(&self) -> anyhow::Result<()> {
+        if self.is_alive()? {
+            if let Err(error) = unsafe { TerminateProcess(self.native(), 0) } {
+                use windows::Win32::Foundation::WAIT_OBJECT_0;
+                // 另一清理方已请求退出时，TerminateProcess 可先拒绝，句柄随后才变为 signaled。
+                if unsafe { WaitForSingleObject(self.native(), 1_000) } != WAIT_OBJECT_0 {
+                    return Err(error).with_context(|| {
+                        format!("结束已验证多开进程 {} 失败", self.process_id)
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 为安全树提供有界且可报告失败的快照；不为无关系统进程逐一打开句柄。
+#[cfg(windows)]
+pub(crate) fn bounded_process_snapshot(limit: usize) -> anyhow::Result<Vec<WindowsProcessInfo>> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }?;
+    let _guard = HandleGuard(snapshot);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
     };
-    if handle.is_invalid() {
-        return Ok(false);
+    let mut result = unsafe { Process32FirstW(snapshot, &mut entry) };
+    let mut processes = Vec::new();
+    loop {
+        if let Err(error) = result {
+            anyhow::ensure!(
+                error.code().0 as u32 == 0x80070012,
+                "无法完整读取多开进程快照：{error}"
+            );
+            return Ok(processes);
+        }
+        anyhow::ensure!(processes.len() < limit, "系统进程快照超过安全上限");
+        processes.push(WindowsProcessInfo {
+            process_id: entry.th32ProcessID,
+            parent_process_id: entry.th32ParentProcessID,
+            exe_file: nul_terminated_wide_to_string(&entry.szExeFile),
+            executable_path: None,
+        });
+        result = unsafe { Process32NextW(snapshot, &mut entry) };
     }
-    let _guard = HandleGuard(handle);
-    if process_birth_id_from_handle(handle) != Some(identity.process_birth_id) {
-        return Ok(false);
-    }
-    let Some(image) = process_image_path_from_handle(handle) else {
-        return Ok(false);
-    };
-    let normalize = |path: &std::path::Path| {
-        path.to_string_lossy()
-            .trim_start_matches(r"\\?\")
-            .to_ascii_lowercase()
-    };
-    if normalize(&image) != normalize(&identity.executable) {
-        return Ok(false);
-    }
-    let Some(arguments) =
-        process_command_line_from_handle(handle).and_then(|line| command_line_arguments(&line))
-    else {
-        return Ok(false);
-    };
-    if !crate::multi_worker::codex_arguments_match(
-        &arguments,
-        &identity.user_data_dir,
-        identity.debug_port,
-    ) || unique_listener_process_id(&loopback_listener_process_ids(identity.debug_port)?)?
-        != Some(identity.process_id)
-    {
-        return Ok(false);
-    }
-    unsafe { TerminateProcess(handle, 0) }.context("结束已验证的多开 Codex 实例失败")?;
-    Ok(true)
 }
 
 /// `ProcessBasicInformation` / `ProcessWow64Information`。
@@ -932,22 +1076,21 @@ fn tcp_listener_table(family: u32) -> anyhow::Result<Vec<u8>> {
 #[cfg(windows)]
 pub(crate) fn loopback_listener_process_ids(port: u16) -> anyhow::Result<Vec<u32>> {
     let mut ids = Vec::new();
-    let mut errors = Vec::new();
     for (family, ipv6) in [(2, false), (23, true)] {
         match tcp_listener_table(family)
             .and_then(|bytes| parse_listener_process_ids(&bytes, ipv6, port))
         {
             Ok(found) => ids.extend(found),
-            Err(error) => errors.push(format!("{error:#}")),
+            Err(error)
+                if ipv6
+                    && error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                        matches!(error.raw_os_error(), Some(50 | 10047 | 10049))
+                    }) => {}
+            Err(error) => return Err(error),
         }
     }
     ids.sort_unstable();
     ids.dedup();
-    anyhow::ensure!(
-        !ids.is_empty() || errors.is_empty(),
-        "{}",
-        errors.join("; ")
-    );
     Ok(ids)
 }
 
@@ -1023,6 +1166,37 @@ fn parse_listener_process_ids(bytes: &[u8], ipv6: bool, port: u16) -> anyhow::Re
 #[cfg(test)]
 mod listener_owner_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn minimum_query_survives_vm_read_denial_but_keeps_query_denial_uncertain() {
+        use windows::core::{Error, HRESULT};
+        let denied = || Error::from_hresult(HRESULT(0x80070005_u32 as i32));
+        let open = |access: windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS, pid| {
+            if access.0 & PROCESS_VM_READ.0 != 0 {
+                return Err(denied());
+            }
+            assert_eq!(access, PROCESS_QUERY_LIMITED_INFORMATION);
+            unsafe { OpenProcess(access, false, pid) }
+        };
+        let pid = std::process::id();
+        assert!(open(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, pid).is_err());
+        let (birth, exited) = process_lifetime_with(pid, open).unwrap().unwrap();
+        assert_eq!(Some(birth), process_birth_id(pid));
+        assert!(!exited);
+        let result = process_lifetime_with(pid, |access, _| {
+            assert_eq!(access, PROCESS_QUERY_LIMITED_INFORMATION);
+            Err(denied())
+        });
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
 
     fn table(ipv6: bool, rows: &[(u32, u16, bool, u32)]) -> Vec<u8> {
         let mut bytes = (rows.len() as u32).to_ne_bytes().to_vec();
