@@ -564,6 +564,71 @@ pub fn force_chinese_locale_config(settings: &BackendSettings) -> Value {
     json!({ "enabled": settings.codex_app_force_chinese_locale, "locale": "zh-CN" })
 }
 
+/// Statsig 已知开关清单（中文说明 + 默认是否覆盖），见 assets/statsig-gates.json。
+const STATSIG_GATES_JSON: &str = include_str!("../assets/statsig-gates.json");
+
+/// 已知开关清单：`[{ id, title, description, defaultOverride, risk, note? }]`。
+///
+/// Feature Lab 的「Statsig 开关」页签按它列出开关；`defaultOverride: true` 的项就是
+/// 总开关打开时默认强制打开的闸门。解析失败（只可能是改坏了 JSON）时返回空清单，测试会兜住。
+pub fn statsig_gate_catalog() -> Vec<Value> {
+    serde_json::from_str::<Value>(STATSIG_GATES_JSON)
+        .ok()
+        .and_then(|value| value.get("gates").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+}
+
+/// Statsig 界面增强的注入配置。
+///
+/// 只包含「纯客户端」的远程开关：隐藏升级/额度推销、放宽网络与流式超时、补开记忆，
+/// 以及原生界面里已经存在但默认灰度不到的功能（消息队列、时间线、侧聊 attach）。
+/// 服务端校验的能力（云端任务、真实配额）不在这里，也改不动。
+///
+/// `gates` 只放默认覆盖项；用户在 Feature Lab 里逐项改的覆盖存在
+/// `codexAppStatsigGateOverrides`，页面从后端设置实时读、叠加在 `gates` 上，不用重新注入。
+pub fn statsig_overrides_config(settings: &BackendSettings) -> Value {
+    let catalog = statsig_gate_catalog();
+    let gates = catalog
+        .iter()
+        .filter(|entry| entry.get("defaultOverride") == Some(&Value::Bool(true)))
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .map(|id| (id.to_string(), Value::Bool(true)))
+        .collect::<serde_json::Map<String, Value>>();
+    json!({
+        "enabled": settings.codex_app_statsig_overrides,
+        // 布尔闸门：值为 true 时强制打开（来自清单里 defaultOverride=true 的项）。
+        "gates": gates,
+        // Feature Lab 用的已知开关清单（中文说明、风险、默认值）。
+        "gateCatalog": catalog,
+        // 实验按 key 覆盖，未列出的 key 保持远端下发值。
+        "experiments": {},
+        // Layer 按 key 覆盖（例如 1574672957 的自定义指令层）。
+        "layers": {},
+        // 动态配置：按 key 覆盖，未列出的 key 保持远端下发值。
+        "dynamicConfigs": {
+            // 网络重试：更耐心的退避，弱网下少断流
+            "3165814200": {
+                "MIN_RETRY_INTERVAL": 400,
+                "MAX_RETRY_INTERVAL": 8000,
+                "RETRY_FACTOR": 1.6,
+                "MAX_RETRY_COUNT": 15
+            },
+            // SSE 首包 / 字节间隔超时
+            "3608673692": {
+                "sse_initial_open_timeout_ms": 90000,
+                "sse_between_bytes_timeout_ms": 90000
+            },
+            // WebSocket 空闲超时
+            "339548201": {
+                "websocket_initial_idle_timeout_ms": 15000,
+                "websocket_idle_timeout_ms": 45000
+            },
+            // 记忆：只打开 Statsig 侧开关；Codex 本体的 features.memories 仍需另开
+            "2808262316": { "enabled": true }
+        }
+    })
+}
+
 fn renderer_after_document_ready(script: &str) -> String {
     format!(
         "(()=>{{const start=()=>{{{script}\n}};if(document.body)start();else document.addEventListener('DOMContentLoaded',start,{{once:true}});}})();"
@@ -607,6 +672,7 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
     let dream_skin_target_runtime = dream_skin_target_runtime_after_document_ready(settings);
     let paste_fix = paste_fix_enabled_config(settings);
     let force_chinese_locale = force_chinese_locale_config(settings);
+    let statsig_overrides = statsig_overrides_config(settings);
     let hide_official_usage_alert = hide_official_usage_alert_config(settings);
     // 原生模块补丁的新文档脚本需要 Page.enable；DOM 增强必须等正常文档就绪，不能访问空的根节点。
     let renderer_runtime = if crate::native_predictions::native_modules_requested(settings) {
@@ -621,7 +687,7 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
             ""
         };
     format!(
-        "{}window.__CODEX_SESSION_DELETE_HELPER__ = {};\nwindow.__CODEX_PLUS_VERSION__ = {};\nwindow.__CODEX_PLUS_BUILD__ = {};\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_PASTE_FIX__ = {};\nwindow.__CODEX_PLUS_FORCE_CHINESE_LOCALE__ = {};\nwindow.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = {};\n{}\n{}\n{}",
+        "{}window.__CODEX_SESSION_DELETE_HELPER__ = {};\nwindow.__CODEX_PLUS_VERSION__ = {};\nwindow.__CODEX_PLUS_BUILD__ = {};\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_PASTE_FIX__ = {};\nwindow.__CODEX_PLUS_FORCE_CHINESE_LOCALE__ = {};\nwindow.__CODEX_PLUS_STATSIG_OVERRIDES__ = {};\nwindow.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = {};\n{}\n{}\n{}",
         instance_identity,
         serde_json::to_string(&helper_url).expect("helper URL should serialize"),
         serde_json::to_string(crate::version::VERSION).expect("version should serialize"),
@@ -636,6 +702,8 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         serde_json::to_string(&paste_fix).expect("paste fix config should serialize"),
         serde_json::to_string(&force_chinese_locale)
             .expect("force Chinese locale config should serialize"),
+        serde_json::to_string(&statsig_overrides)
+            .expect("statsig overrides config should serialize"),
         serde_json::to_string(&hide_official_usage_alert)
             .expect("usage alert config should serialize"),
         format!(

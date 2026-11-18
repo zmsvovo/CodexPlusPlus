@@ -77,10 +77,11 @@ it("隐藏原生标签时同步退出无障碍树，避免读屏念两遍", asyn
   assert.match(source, /native\.removeAttribute\("aria-hidden"\)/);
 });
 
-it("只有一个供应商时不接管原生列表", async () => {
+it("只有一个供应商时图标模式保留原生列表，仍提供视图切换", async () => {
   const source = await readShard();
-  assert.match(source, /if \(groups\.length < 2\) \{/);
-  // 单组时要能退回原始状态。
+  assert.match(source, /const grouped = mode === "list" \|\| groups\.length >= 2/);
+  assert.match(source, /if \(!grouped\)/);
+  assert.match(source, /codexPlusModelPickerViewControls\(list\)/);
   assert.match(source, /codexPlusModelPickerClear\(list\)/);
   assert.match(source, /list\.removeAttribute\("data-codex-plus-model-groups"\)/);
 });
@@ -124,15 +125,62 @@ it("重注入时与上一个实例交接，不先拆再建造成闪烁", async (
   assert.match(source, /releaseDom\(\)/, "彻底还原要有单独出口");
 });
 
+it("内置拓展停用时清理重注入前遗留的分组列表", async () => {
+  const source = await readShard();
+  const orphan = { id: "orphan" };
+  const state = { disposed: false, activeList: null, observer: null };
+  const cleared: unknown[] = [];
+  const scan = new Function(
+    "codexPlusModelPickerGroupsState", "globalThis", "document", "codexPlusModelPickerClear",
+    `${functionSource(source, "codexPlusModelPickerScan")}\nreturn codexPlusModelPickerScan;`,
+  )(state, { __codexPlusBuiltinInactive: new Set(["model-picker-groups"]) },
+    { querySelectorAll: (selector: string) => {
+      assert.equal(selector, "[data-codex-plus-model-groups]");
+      return [orphan];
+    } }, (list: unknown) => cleared.push(list));
+  scan();
+  assert.deepEqual(cleared, [orphan]);
+  assert.match(source, /if \(globalThis\.__codexPlusBuiltinInactive\?\.has\("model-picker-groups"\)\) codexPlusModelPickerScan\(\);/);
+});
+
 it("入口使用独立供应商图标，并通过导航显示模型列表", async () => {
   const source = await readShard();
   assert.match(source, /codex-plus-model-provider-grid/);
   assert.match(source, /codex-plus-model-provider-icon/);
   assert.match(source, /function codexPlusModelPickerNavigate\(list, groupId\)/);
   assert.match(source, /function codexPlusModelPickerSyncNavigation\(list, groups\)/);
-  assert.doesNotMatch(source, /全部展开|全部折叠/);
+  const controls = functionSource(source, "codexPlusModelPickerViewControls");
+  assert.match(controls, /state\.viewMode === "list"/);
+  assert.match(controls, /\[\["list", text\.listView\]\]/);
   // 入口的无障碍名称仍要包含供应商、模型数和默认身份。
   assert.match(source, /groupAria/);
+});
+
+it("默认模型名称只使用后端有效配置身份，缺失时明确显示未获取状态", async () => {
+  const source = await readShard();
+  const resolveName = (catalog: unknown) => new Function(
+    "codexModelCatalog", "codexPlusModelPickerText",
+    `${functionSource(source, "codexPlusModelPickerDefaultModelName")}\nreturn codexPlusModelPickerDefaultModelName();`,
+  )(catalog, () => ({ defaultUnavailable: "未获取到默认模型" }));
+  const catalog = {
+    effective_config_model: "provider-b/model-b",
+    default_model: "provider-a/model-a",
+    model: "provider-a/model-a",
+    models: ["provider-a/model-a"],
+    modelMetadata: {
+      "provider-a/model-a": { displayName: "Model A" },
+      "provider-b/model-b": { displayName: "Model B（供应商 B）" },
+    },
+  };
+  assert.equal(resolveName(catalog), "Model B（供应商 B）");
+  assert.equal(resolveName({ ...catalog, effective_config_model: "group/123" }), "group/123");
+  assert.equal(resolveName({ ...catalog, effective_config_model: "" }), "未获取到默认模型");
+  assert.equal(resolveName({ ...catalog, effective_config_model: null }), "未获取到默认模型");
+  assert.equal(resolveName({ models: catalog.models, modelMetadata: catalog.modelMetadata }), "未获取到默认模型");
+  assert.equal(resolveName({
+    effective_config_model: "route/auto",
+    model_metadata: { "route/auto": { display_name: "自动路由" } },
+  }), "自动路由");
 });
 
 it("只持久化供应商身份，不把当前列表或旧折叠状态带到下一次打开", async () => {
@@ -369,6 +417,96 @@ it("同一菜单扫描保留当前供应商，重新打开时回到供应商入�
   assert.deepEqual(observed, [secondList], "同一个菜单只注册一个观察器");
 });
 
+it("视图切换和批量展开折叠保持状态与原生焦点", async () => {
+  const source = await readShard();
+  const state = { viewMode: "icons", collapsed: new Set<string>() };
+  const stored: string[] = [];
+  const focused: string[] = [];
+  let cleared = 0;
+  let patched = 0;
+  let persisted = 0;
+  const list = { isConnected: true, querySelector: (selector: string) => ({
+    focus: () => { focused.push(selector); },
+  }) };
+  const action = new Function(
+    "codexPlusModelPickerGroupsState", "window", "codexPlusModelPickerViewStoreKey",
+    "codexPlusModelPickerClear", "codexPlusModelPickerUniqueGroupIds", "codexPlusModelPickerGroups",
+    "codexPlusModelPickerRows", "codexPlusModelPickerDefaultProviderName", "codexPlusModelPickerPatch",
+    "codexPlusModelPickerPersistCollapsed",
+    `${functionSource(source, "codexPlusModelPickerViewAction")}\nreturn codexPlusModelPickerViewAction;`,
+  )(state, { localStorage: { setItem: (_key: string, value: string) => stored.push(value) } },
+    "view", () => { cleared++; }, (groups: unknown) => groups, () => [{ id: "a" }, { id: "b" }],
+    () => [], () => "", () => { patched++; }, () => { persisted++; });
+  action(list, "list");
+  assert.equal(state.viewMode, "list");
+  assert.deepEqual(stored, ["list"]);
+  assert.match(focused.at(-1)!, /icons/);
+  action(list, "collapse");
+  assert.deepEqual([...state.collapsed], ["a", "b"]);
+  action(list, "expand");
+  assert.equal(state.collapsed.size, 0);
+  action(list, "icons");
+  assert.equal(state.viewMode, "icons");
+  assert.deepEqual(stored, ["list", "icons"]);
+  assert.match(focused.at(-1)!, /list/);
+  assert.equal(cleared, 2);
+  assert.equal(patched, 4);
+  // 批量折叠 / 展开要落盘，切换视图不碰折叠记录（#3073）。
+  assert.equal(persisted, 2);
+  action({ ...list, isConnected: false }, "list");
+  assert.equal(patched, 4);
+});
+
+it("观察器忽略自身属性但响应原生选中与结构变化", async () => {
+  const source = await readShard();
+  const list = {};
+  const state = { activeList: null as unknown, activeGroupId: "", observer: null as any,
+    patchedLists: new WeakSet(), viewMode: "list", signature: "list:old" };
+  let scheduled = 0;
+  let callback: (records: any[]) => void = () => {};
+  let options: any;
+  class Observer {
+    constructor(cb: (records: any[]) => void) { callback = cb; }
+    observe(_list: unknown, value: unknown) { options = value; }
+    disconnect() {}
+  }
+  const needs = new Function(
+    "codexPlusModelPickerGroupsExtMark", "codexPlusModelPickerList", "codexPlusModelPickerMenu",
+    "codexPlusModelPickerRows", "codexPlusModelPickerGroups", "codexPlusModelPickerDefaultProviderName",
+    "codexPlusModelPickerUniqueGroupIds", "codexPlusModelPickerFingerprint", "codexPlusModelPickerHeadersIntact",
+    "codexPlusModelPickerGroupsState",
+    `${functionSource(source, "codexPlusModelPickerNeedsRescan")}\nreturn codexPlusModelPickerNeedsRescan;`,
+  )("model-groups", () => list, () => ({}), () => [], () => [{}], () => "",
+    (groups: unknown) => groups, () => "new", () => true, state);
+  const observe = new Function(
+    "codexPlusModelPickerGroupsState", "codexPlusModelPickerClear", "MutationObserver",
+    "codexPlusModelPickerNeedsRescan", "codexPlusModelPickerScheduleRescan",
+    `${functionSource(source, "codexPlusModelPickerObserveList")}\nreturn codexPlusModelPickerObserveList;`,
+  )(state, () => {}, Observer, needs, () => { scheduled++; });
+  observe(list);
+  assert.deepEqual(options.attributeFilter, ["aria-checked", "data-state", "data-model-selected"]);
+  assert.equal(options.childList, true);
+  assert.equal(options.subtree, true);
+  const deliverAttribute = (name: string, radio: boolean) => {
+    if (options.attributeFilter.includes(name)) {
+      callback([{ type: "attributes", attributeName: name, target: { matches: () => radio } }]);
+    }
+  };
+  for (const name of ["style", "class", "data-codex-plus-model-ordering",
+    "data-codex-plus-model-order", "data-codex-plus-model-view-mode", "data-codex-plus-model-heading"]) {
+    deliverAttribute(name, true);
+  }
+  assert.equal(scheduled, 0);
+  for (const name of options.attributeFilter) deliverAttribute(name, true);
+  assert.equal(scheduled, 3);
+  const own = { nodeType: 1, closest: () => ({}) };
+  callback([{ type: "childList", addedNodes: [own], removedNodes: [] }]);
+  assert.equal(scheduled, 3);
+  const native = { nodeType: 1, closest: () => null };
+  callback([{ type: "childList", addedNodes: [native], removedNodes: [] }]);
+  assert.equal(scheduled, 4);
+});
+
 it("供应商网格支持方向键，模型列表中的 Escape 返回供应商入口", async () => {
   const source = await readShard();
   let focused = -1;
@@ -522,7 +660,10 @@ it("目录条目按别名匹配，且只用它补分组 id、不用它决定显�
   // 网关把同名模型的后几家写成 `名字（供应商 id）`，标题要显示打过码的完整账号名；别名命中仍不决定归属。
   assert.match(source, /const provider = exactKnown\?\.provider \|\| split\.provider \|\| known\?\.provider/);
   // 先按原文比（网关关掉「模型名后带供应商」时同名几份只差零宽字符），再按宽松归一化比。
-  assert.match(source, /const exactKnown = exact\.get\(`raw\\u0000\$\{identity\.text\}`\)\s*\|\| exact\.get\(codexPlusModelPickerNormalizeLoose\(identity\.text\)\)/);
+  const rows = functionSource(source, "codexPlusModelPickerRows");
+  assert.match(rows, /const current = model \? exact\.get\(`model\\u0000\$\{model\}`\)/);
+  assert.match(rows, /exact\.get\(`raw\\u0000\$\{identity\.text\}`\)/);
+  assert.match(rows, /codexPlusModelPickerNativeLabelKey\(identity\.text\)/);
   assert.match(source, /const rawKey = `raw\\u0000\$\{String\(displayName\)/);
   // 组内任意一行命中默认分组即认定该组是默认（裸名行的 id 可能来自目录）。
   assert.match(source, /group\.entries\.some\(\(entry\) => entry\.groupId === defaultGroupId/);
@@ -623,6 +764,39 @@ it("认不出归属的行收进同一个「其他供应商」组，不被有名�
   assert.equal(unnamed.length, 1, "无名的行只能有一个分组");
   assert.equal(unnamed[0].entries.length, 3);
   assert.equal(groups.length, 3);
+});
+
+it("同一权威分组即使在列表里交错也只生成一个入口", async () => {
+  const source = await readShard();
+  const groupsOf = new Function(
+    `${functionSource(source, "codexPlusModelPickerGroups")}\nreturn codexPlusModelPickerGroups;`,
+  )() as (rows: unknown[]) => Array<{ id: string; name: string; entries: Array<{ name: string }> }>;
+  const groups = groupsOf([
+    { name: "group-1", provider: "模型组", groupId: "groups", authoritativeGroupId: true },
+    { name: "hanhe-1", provider: "寒鹤", groupId: "hanhe", authoritativeGroupId: true },
+    { name: "group-2", provider: "模型组", groupId: "groups", authoritativeGroupId: true },
+    { name: "fusheng-1", provider: "浮生", groupId: "fusheng", authoritativeGroupId: true },
+    { name: "hanhe-2", provider: "寒鹤", groupId: "hanhe", authoritativeGroupId: true },
+    { name: "group-3", provider: "模型组", groupId: "groups", authoritativeGroupId: true },
+  ]);
+  assert.deepEqual(groups.map(group => [group.name, group.entries.map(entry => entry.name)]), [
+    ["模型组", ["group-1", "group-2", "group-3"]],
+    ["寒鹤", ["hanhe-1", "hanhe-2"]],
+    ["浮生", ["fusheng-1"]],
+  ]);
+});
+
+it("同名但不同权威身份不能被合并，无法确认的条目也不猜测身份", async () => {
+  const source = await readShard();
+  const groupsOf = new Function(
+    `${functionSource(source, "codexPlusModelPickerGroups")}\nreturn codexPlusModelPickerGroups;`,
+  )() as (rows: unknown[]) => Array<{ id: string; entries: Array<{ name: string }> }>;
+  const groups = groupsOf([
+    { name: "one", provider: "同名", groupId: "id-a", authoritativeGroupId: true },
+    { name: "unknown", provider: "同名", groupId: "", authoritativeGroupId: false },
+    { name: "two", provider: "同名", groupId: "id-b", authoritativeGroupId: true },
+  ]);
+  assert.deepEqual(groups.map(group => group.entries.map(entry => entry.name)), [["one"], ["unknown"], ["two"]]);
 });
 
 it("目录快照缺元数据时用记下的权威归属兜底，后缀猜出来的不套给裸名行（#2860）", async () => {

@@ -104,7 +104,8 @@ test("Fast-only UI metadata leaves an existing native descriptor's name and reas
     codexPlusModelMetadata: () => metadata,
     modelReasoningEfforts: () => { throw new Error("Fast does not configure reasoning choices"); },
   });
-  vm.runInContext(extract(fragment("70-model-catalog.js"), "applyCodexPlusModelMetadata"), context);
+  vm.runInContext(["applyCodexPlusModelMetadata", "codexPlusModelInputModalities", "codexPlusModelImageDetailOriginal"]
+    .map((name) => extract(fragment("70-model-catalog.js"), name)).join("\n"), context);
   const descriptor = { displayName: "Native Grok", description: "Native details", defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "high" }] };
   const original = structuredClone(descriptor);
   assert.equal(context.applyCodexPlusModelMetadata(descriptor, "grok-custom"), false);
@@ -114,4 +115,38 @@ test("Fast-only UI metadata leaves an existing native descriptor's name and reas
   assert.equal(descriptor.displayName, "Explicit name");
   assert.equal(descriptor.description, "Explicit details");
   assert.equal(descriptor.defaultReasoningEffort, "low");
+});
+
+test("declared Ultra Fast tiers reach existing and newly injected native model descriptors", () => {
+  const entry = JSON.parse(readFileSync(new URL("../../../assets/gpt62-sol-model-metadata-compat.json", import.meta.url), "utf8")).models[0];
+  const metadata: Record<string, unknown> = {
+    serviceTiersOverride: true,
+    serviceTiers: entry.service_tiers,
+    additionalSpeedTiers: entry.additional_speed_tiers,
+  };
+  const context = vm.createContext({
+    codexPlusModelMetadata: () => metadata,
+    modelReasoningEfforts: () => [],
+    codexModelCatalog: {},
+  });
+  vm.runInContext(["applyCodexPlusModelMetadata", "codexPlusModelDescriptor",
+    "codexPlusModelInputModalities", "codexPlusModelImageDetailOriginal"]
+    .map((name) => extract(fragment("70-model-catalog.js"), name)).join("\n"), context);
+  const descriptor = { displayName: "Native Sol", serviceTiers: [{ id: "priority" }] };
+  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "gpt-6.2-sol"), true);
+  const plain = (value: unknown) => JSON.parse(JSON.stringify(value));
+  assert.deepEqual(plain(descriptor.serviceTiers), entry.service_tiers);
+  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "gpt-6.2-sol"), false);
+  const injected = context.codexPlusModelDescriptor("gpt-6.2-sol");
+  assert.deepEqual(plain(injected.serviceTiers), entry.service_tiers);
+  assert.deepEqual(plain(injected.additionalSpeedTiers), ["fast", "ultrafast"]);
+  injected.serviceTiers[1].id = "changed";
+  assert.equal(entry.service_tiers[1].id, "ultrafast");
+  metadata.serviceTiers = [];
+  metadata.additionalSpeedTiers = [];
+  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "gpt-6.2-sol"), true);
+  assert.deepEqual(plain(descriptor.serviceTiers), []);
+  metadata.serviceTiersOverride = false;
+  descriptor.serviceTiers = [{ id: "priority" }];
+  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "unknown-model"), false);
 });

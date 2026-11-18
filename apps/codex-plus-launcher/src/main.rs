@@ -54,7 +54,11 @@ impl StartupReply {
         if result.is_ok() {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.ready = true;
-            record_session_probe(&state.options, state.status_started_at_ms);
+            record_session_probe(
+                &state.options,
+                state.status_started_at_ms,
+                state.launch_extra_args.clone(),
+            );
         }
         self.reply.send(result)
     }
@@ -62,10 +66,12 @@ impl StartupReply {
 
 struct SessionState {
     ready: bool,
+    closing: bool,
     attach_only: bool,
     options: LaunchOptions,
     requested_at_ms: u64,
     status_started_at_ms: u64,
+    launch_extra_args: Option<Vec<String>>,
 }
 
 /// 本进程 launcher 会话的只读快照，供自动接管的判据使用。
@@ -82,6 +88,10 @@ pub struct SessionSnapshot {
     /// `latest-status.json` 里的状态（`running` / `running_degraded` / …）。
     pub status: Option<String>,
     pub debug_port: Option<u16>,
+    /// 已就绪会话实际使用的应用目录，不从旧状态文件推测。
+    pub app_dir: Option<PathBuf>,
+    /// 本会话启动时实际使用的附加参数；接管已有实例时可能未知。
+    pub launch_extra_args: Option<Vec<String>>,
     /// 该会话的状态代际，用来判断是不是同一次启动。
     pub started_at_ms: Option<u64>,
 }
@@ -96,18 +106,24 @@ struct SessionProbe {
     helper_port: u16,
     app_dir: Option<std::path::PathBuf>,
     started_at_ms: u64,
+    launch_extra_args: Option<Vec<String>>,
 }
 
 fn session_probe_slot() -> &'static Mutex<Option<SessionProbe>> {
     SESSION_PROBE.get_or_init(|| Mutex::new(None))
 }
 
-fn record_session_probe(options: &LaunchOptions, started_at_ms: u64) {
+fn record_session_probe(
+    options: &LaunchOptions,
+    started_at_ms: u64,
+    launch_extra_args: Option<Vec<String>>,
+) {
     let probe = SessionProbe {
         debug_port: options.debug_port,
         helper_port: options.helper_port,
         app_dir: options.app_dir.clone(),
         started_at_ms,
+        launch_extra_args,
     };
     *session_probe_slot()
         .lock()
@@ -120,13 +136,24 @@ fn clear_session_probe() {
         .unwrap_or_else(|error| error.into_inner()) = None;
 }
 
+fn mark_session_closing(state: &Mutex<SessionState>) {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    state.ready = false;
+    state.closing = true;
+    clear_session_probe();
+}
+
 type SessionRunner = Arc<
     dyn Fn(LaunchOptions, tokio::sync::oneshot::Receiver<()>, StartupReply) -> SessionFuture
         + Send
         + Sync,
 >;
-type ActivationRunner =
-    Arc<dyn Fn(LaunchOptions, u64) -> Pin<Box<dyn Future<Output = Result<()>>>> + Send + Sync>;
+type ActivationRunner = Arc<
+    dyn Fn(LaunchOptions, u64, Arc<Mutex<SessionState>>)
+            -> Pin<Box<dyn Future<Output = Result<()>>>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug)]
 struct StartupBusy;
@@ -181,10 +208,12 @@ impl EmbeddedSession {
     ) -> Result<Self> {
         let state = Arc::new(Mutex::new(SessionState {
             ready: false,
+            closing: false,
             attach_only,
             options: options.clone(),
             requested_at_ms,
             status_started_at_ms: requested_at_ms,
+            launch_extra_args: None,
         }));
         let ready = StartupReply {
             reply: ready,
@@ -312,10 +341,11 @@ fn runtime_commands_sender() -> Result<tokio::sync::mpsc::UnboundedSender<Runtim
     worker.commands_or_start(|| {
         RuntimeWorker::spawn(
             Arc::new(|options, stop, ready| Box::pin(run_embedded_session(options, stop, ready))),
-            Arc::new(|options, started_at_ms| {
-                Box::pin(
-                    async move { activate_and_write_running_status(&options, started_at_ms).await },
-                )
+            Arc::new(|options, started_at_ms, state| {
+                Box::pin(async move {
+                    activate_existing_codex_app(&options).await?;
+                    publish_activated_session(&options, started_at_ms, &state)
+                })
             }),
         )
     })
@@ -417,6 +447,10 @@ pub fn session_snapshot() -> SessionSnapshot {
             .as_ref()
             .map(|probe| probe.debug_port)
             .or_else(|| latest.as_ref().and_then(|latest| latest.debug_port)),
+        app_dir: probe.as_ref().and_then(|probe| probe.app_dir.clone()),
+        launch_extra_args: probe
+            .as_ref()
+            .and_then(|probe| probe.launch_extra_args.clone()),
         started_at_ms: probe
             .as_ref()
             .map(|probe| probe.started_at_ms)
@@ -461,17 +495,27 @@ async fn runtime_commands(
                         if let Some(current) = &session {
                             let current_options = {
                                 let state = current.state.lock().unwrap_or_else(|error| error.into_inner());
-                                state.ready.then(|| (state.options.clone(), state.status_started_at_ms))
-                            };
-                            let result = match current_options {
-                                Some((current_options, started_at_ms)) => {
-                                    record_session_probe(&current_options, started_at_ms);
-                                    if attach_only { Ok(()) } else { activate(current_options, started_at_ms).await }
+                                if !state.ready && !state.closing {
+                                    let _ = ready.send(Err(StartupBusy.into()));
+                                    continue;
                                 }
-                                None => Err(StartupBusy.into()),
+                                state.ready.then(|| (state.options.clone(), state.status_started_at_ms, state.launch_extra_args.clone()))
                             };
-                            let _ = ready.send(result);
-                            continue;
+                            if let Some((current_options, started_at_ms, launch_extra_args)) = current_options {
+                                let result = if attach_only { Ok(()) } else { activate(current_options.clone(), started_at_ms, current.state.clone()).await };
+                                let state = current.state.lock().unwrap_or_else(|error| error.into_inner());
+                                // 激活跨 await 时旧目标可能已退出，不能把新打开的 App 交给旧 helper。
+                                if state.ready && !state.closing && !current.thread.is_finished() {
+                                    record_session_probe(&current_options, started_at_ms, launch_extra_args);
+                                    let _ = ready.send(result);
+                                    continue;
+                                }
+                            }
+                        }
+                        // 先等退出中的会话释放 helper/runtime，再走完整启动；不取消已开始的恢复事务。
+                        if let Some(previous) = session.take() {
+                            let _ = previous.join().await;
+                            clear_session_probe();
                         }
                         match EmbeddedSession::spawn(options, requested_at_ms, attach_only, ready.clone(), runner.clone()) {
                             Ok(current) => session = Some(current),
@@ -641,6 +685,8 @@ async fn run_embedded_session(
                 },
             )
             .await;
+            mark_session_closing(hooks.session_state.as_ref().unwrap());
+            hooks.core.stop_bridge_watchdog().await;
             handle.stop_isolated_api_quota_gate().await;
             stopped_by_host = host_stop;
             result
@@ -649,6 +695,7 @@ async fn run_embedded_session(
         Err(error) => Err(error),
     };
     // 启动中取消也要显式清理。不能依赖进程退出，否则 GUI 仍在时端口和系统浏览器会残留。
+    mark_session_closing(hooks.session_state.as_ref().unwrap());
     hooks.shutdown_helper(options.helper_port).await;
     hooks.stop_native_browser_compatibility().await;
     if stopped_by_host {
@@ -776,6 +823,10 @@ async fn activate_and_write_running_status(
     started_at_ms: u64,
 ) -> Result<()> {
     activate_existing_codex_app(options).await?;
+    write_activated_running_status(options, started_at_ms)
+}
+
+fn write_activated_running_status(options: &LaunchOptions, started_at_ms: u64) -> Result<()> {
     options.status_store.save_latest(&LaunchStatus {
         status: "running".to_string(),
         message: "Existing Codex instance activated".to_string(),
@@ -789,6 +840,16 @@ async fn activate_and_write_running_status(
         aumid: None,
         ..LaunchStatus::default()
     })
+}
+
+fn publish_activated_session(
+    options: &LaunchOptions,
+    started_at_ms: u64,
+    state: &Mutex<SessionState>,
+) -> Result<()> {
+    let state = state.lock().unwrap_or_else(|error| error.into_inner());
+    anyhow::ensure!(state.ready && !state.closing, "原 Codex 会话已退出，正在重新准备后台服务");
+    write_activated_running_status(options, started_at_ms)
 }
 
 async fn wait_for_session_exit_or_stop(
@@ -1200,6 +1261,10 @@ impl LaunchHooks for LauncherHooks {
         codex_plus_core::watcher::find_session_index_cleanup_blocking_processes().is_empty()
     }
 
+    fn codex_desktop_running(&self) -> bool {
+        !codex_plus_core::watcher::find_session_index_cleanup_blocking_processes().is_empty()
+    }
+
     async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()> {
         let outcomes = tokio::task::spawn_blocking(|| {
             let requests = codex_plus_core::remote_control_recovery::load_pending_remote_control_recoveries(None)?;
@@ -1378,6 +1443,12 @@ impl LaunchHooks for LauncherHooks {
                 ),
             });
         }
+        if let Some(state) = &self.session_state {
+            state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .launch_extra_args = Some(extra_args.to_vec());
+        }
         self.core
             .launch_codex(app_dir, debug_port, settings, extra_args, instance)
             .await
@@ -1455,11 +1526,9 @@ impl LaunchHooks for LauncherHooks {
     ) -> anyhow::Result<()> {
         let result = self.core.wait_for_codex_exit(launch, debug_port).await;
         if let Some(state) = &self.session_state {
-            state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .ready = false;
+            mark_session_closing(state);
         }
+        self.core.stop_bridge_watchdog().await;
         result
     }
 
@@ -1597,6 +1666,19 @@ impl BridgeDataService for LauncherDataService {
         tokio::task::spawn_blocking(move || adapter.find_archived_thread_by_title(&title))
             .await
             .map_err(|error| anyhow::anyhow!("archived lookup task failed: {error}"))
+    }
+
+    async fn prepare_thread_provider(&self, request: Value) -> anyhow::Result<Value> {
+        tokio::task::spawn_blocking(move || {
+            let settings = codex_plus_core::settings::SettingsStore::default().load()?;
+            codex_plus_data::prepare_thread_provider(
+                &codex_plus_core::codex_sqlite::default_codex_home_dir(),
+                settings.provider_sync_enabled,
+                &request,
+            )
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("Thread provider preparation task failed: {error}"))?
     }
 
     async fn recover_remote_control_session(&self, thread_id: String) -> anyhow::Result<Value> {
@@ -1810,6 +1892,10 @@ impl BridgeRuntimeService for LauncherRuntimeService {
             anyhow::bail!("脚本 id 不能为空");
         }
         codex_plus_core::script_market::install_market_script_by_id(&self.user_scripts, id).await
+    }
+
+    async fn script_market_package(&self, action: &str, payload: Value) -> anyhow::Result<Value> {
+        codex_plus_core::script_market::market_package_request(&self.user_scripts, action, &payload).await
     }
 
     async fn open_devtools(&self) -> anyhow::Result<Value> {
@@ -2363,7 +2449,7 @@ mod tests {
                     let _ = stop.await;
                 })
             }),
-            Arc::new(|_, _| panic!("restoration must not activate or restart Codex")),
+            Arc::new(|_, _, _| panic!("restoration must not activate or restart Codex")),
         )
         .unwrap();
         for _ in 0..2 {
@@ -2393,7 +2479,7 @@ mod tests {
                             let _ = stop.await;
                         })
                     }),
-                    Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                    Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
                 )
             })
             .unwrap();
@@ -2430,8 +2516,129 @@ mod tests {
     }
 
     #[test]
+    fn embedded_runtime_rebuilds_if_the_session_exits_during_activation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let temp = tempfile::tempdir().unwrap();
+        let options = LaunchOptions {
+            status_store: codex_plus_core::status::StatusStore::new(temp.path().join("status.json")),
+            ..LaunchOptions::default()
+        };
+        let launched = Arc::new(AtomicUsize::new(0));
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let (exit, exiting) = tokio::sync::oneshot::channel();
+        let (closing, closed) = tokio::sync::oneshot::channel();
+        let (cleanup, cleanup_allowed) = tokio::sync::oneshot::channel();
+        let exiting = Arc::new(Mutex::new(Some(exiting)));
+        let cleanup_allowed = Arc::new(Mutex::new(Some(cleanup_allowed)));
+        let closing = Arc::new(Mutex::new(Some(closing)));
+        let runner: SessionRunner = {
+            let launched = launched.clone();
+            let cleaned = cleaned.clone();
+            Arc::new(move |_, stop, ready| {
+                let generation = launched.fetch_add(1, Ordering::SeqCst);
+                let cleaned = cleaned.clone();
+                let exiting = exiting.lock().unwrap().take();
+                let cleanup_allowed = cleanup_allowed.lock().unwrap().take();
+                let closing = closing.lock().unwrap().take();
+                Box::pin(async move {
+                    assert_eq!(cleaned.load(Ordering::SeqCst), generation);
+                    let state = ready.state.clone();
+                    ready.send(Ok(())).unwrap();
+                    if generation == 0 {
+                        exiting.unwrap().await.unwrap();
+                        mark_session_closing(&state);
+                        closing.unwrap().send(()).unwrap();
+                        cleanup_allowed.unwrap().await.unwrap();
+                    } else {
+                        let _ = stop.await;
+                    }
+                    cleaned.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+        };
+        let activation = Arc::new(Mutex::new(Some((exit, closed, cleanup))));
+        let worker = RuntimeWorker::spawn(runner, Arc::new(move |options, started_at_ms, state| {
+            let (exit, closed, cleanup) = activation.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                exit.send(()).unwrap();
+                closed.await.unwrap();
+                let result = publish_activated_session(&options, started_at_ms, &state);
+                cleanup.send(()).unwrap();
+                result
+            })
+        })).unwrap();
+        send_test_command(&worker, |reply| test_start_command(options.clone(), reply)).unwrap();
+        send_test_command(&worker, |reply| test_start_command(options.clone(), reply)).unwrap();
+        send_test_command(&worker, RuntimeCommand::Shutdown).unwrap();
+        worker.thread.join().unwrap();
+        assert_eq!(launched.load(Ordering::SeqCst), 2, "activation must not reuse an exiting session");
+        assert_eq!(cleaned.load(Ordering::SeqCst), 2);
+        assert!(options.status_store.load_latest().unwrap().is_none(), "stale activation must not publish running");
+    }
+
+    #[test]
+    fn embedded_runtime_keeps_a_live_session_when_activation_fails() {
+        let launched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let launches = launched.clone();
+        let worker = RuntimeWorker::spawn(
+            Arc::new(move |_, stop, ready| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    ready.send(Ok(())).unwrap();
+                    let _ = stop.await;
+                })
+            }),
+            Arc::new(|_, _, _| Box::pin(async { anyhow::bail!("fixture activation error") })),
+        ).unwrap();
+        send_test_command(&worker, |reply| test_start_command(LaunchOptions::default(), reply)).unwrap();
+        let result = send_test_command(&worker, |reply| test_start_command(LaunchOptions::default(), reply));
+        send_test_command(&worker, RuntimeCommand::Shutdown).unwrap();
+        worker.thread.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("fixture activation error"));
+        assert_eq!(launched.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn embedded_runtime_deduplicates_start_and_waits_for_cleanup_before_restarting() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        let child_root = std::env::var_os("CODEX_PLUS_RUNTIME_PROBE_TEST_ROOT");
+        if child_root.is_none() {
+            let fixture = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tests::embedded_runtime_deduplicates_start_and_waits_for_cleanup_before_restarting",
+                    "--nocapture",
+                ])
+                .env("CODEX_PLUS_RUNTIME_PROBE_TEST_ROOT", fixture.path());
+            for (variable, directory) in [
+                ("CODEX_PLUS_STATE_DIR", "state"),
+                ("CODEX_HOME", "home"),
+                ("CODEX_SQLITE_HOME", "sqlite"),
+                ("APPDATA", "appdata"),
+                ("XDG_CONFIG_HOME", "xdg"),
+            ] {
+                let directory = fixture.path().join(directory);
+                std::fs::create_dir(&directory).unwrap();
+                command.env(variable, directory);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(codex_plus_core::windows_create_no_window());
+            }
+            // 其他 runtime 用例也会清空进程级快照；在单独测试进程内验证该快照。
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(fixture.path().join("completed")).unwrap(), b"ok");
+            return;
+        }
         let launched = Arc::new(AtomicUsize::new(0));
         let cleaned = Arc::new(AtomicUsize::new(0));
         let activations = Arc::new(AtomicUsize::new(0));
@@ -2459,6 +2666,8 @@ mod tests {
                         std::future::pending::<()>().await;
                     });
                     tokio::task::yield_now().await;
+                    ready.state.lock().unwrap().launch_extra_args =
+                        Some(vec!["--user-data-dir=C:\\test\\started-instance".to_string()]);
                     ready.send(Ok(())).unwrap();
                     let _ = stop.await;
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -2469,7 +2678,7 @@ mod tests {
         let activated = activations.clone();
         let worker = RuntimeWorker::spawn(
             runner,
-            Arc::new(move |options, started_at_ms| {
+            Arc::new(move |options, started_at_ms, _| {
                 assert_eq!(options.debug_port, LaunchOptions::default().debug_port);
                 assert_eq!(started_at_ms, 100);
                 activated.fetch_add(1, Ordering::SeqCst);
@@ -2481,6 +2690,10 @@ mod tests {
             test_start_command(LaunchOptions::default(), reply)
         })
         .unwrap();
+        assert_eq!(
+            session_probe_slot().lock().unwrap().as_ref().unwrap().launch_extra_args,
+            Some(vec!["--user-data-dir=C:\\test\\started-instance".to_string()])
+        );
         send_test_command(&worker, |reply| {
             test_start_command(
                 LaunchOptions {
@@ -2491,6 +2704,10 @@ mod tests {
             )
         })
         .unwrap();
+        assert_eq!(
+            session_probe_slot().lock().unwrap().as_ref().unwrap().launch_extra_args,
+            Some(vec!["--user-data-dir=C:\\test\\started-instance".to_string()])
+        );
         assert_eq!(launched.load(Ordering::SeqCst), 1);
         assert_eq!(activations.load(Ordering::SeqCst), 1);
         send_test_command(&worker, RuntimeCommand::Stop).unwrap();
@@ -2505,6 +2722,7 @@ mod tests {
         worker.thread.join().unwrap();
         assert_eq!(cleaned.load(Ordering::SeqCst), 2);
         assert_eq!(connections_dropped.load(Ordering::SeqCst), 2);
+        std::fs::write(PathBuf::from(child_root.unwrap()).join("completed"), b"ok").unwrap();
     }
 
     #[test]
@@ -2516,7 +2734,7 @@ mod tests {
             })
         });
         let worker =
-            RuntimeWorker::spawn(runner, Arc::new(|_, _| Box::pin(async { Ok(()) }))).unwrap();
+            RuntimeWorker::spawn(runner, Arc::new(|_, _, _| Box::pin(async { Ok(()) }))).unwrap();
         let (ready, pending) = mpsc::channel();
         worker
             .commands
@@ -2549,7 +2767,7 @@ mod tests {
             })
         });
         let worker =
-            RuntimeWorker::spawn(runner, Arc::new(|_, _| Box::pin(async { Ok(()) }))).unwrap();
+            RuntimeWorker::spawn(runner, Arc::new(|_, _, _| Box::pin(async { Ok(()) }))).unwrap();
         let (ready, pending) = mpsc::channel();
         worker
             .commands

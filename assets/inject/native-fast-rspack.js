@@ -32,8 +32,7 @@
       pattern: [
         `function\\((?<manager>${id}),\\{runtime:(?<runtime>${id})\\},(?<before>${id}),${id}\\)\\{let (?<pending>${id})=null;`,
         `return\\{async readServiceTier\\((?<model>${id})\\)\\{for\\(;null!=\\k<pending>;\\)await \\k<pending>\\.catch\\(\\(\\)=>void 0\\);`,
-        // 26.1103 将读配置/模型的 helper 内联为匿名函数；不改变其解析规则。
-        `return \\k<before>\\(\\),(?:${id}|async function\\(${id},${id},${id},${id}\\)\\{[^]{0,2400}?\\})\\(\\k<manager>\\.requestClient,\\k<manager>\\.logger,\\k<model>,async\\(\\)=>\\{`,
+        `return \\k<before>\\(\\),(?:${id}|async function\\(${id},${id},${id},${id}\\)\\{[^]{0,1800}?\\})\\(\\k<manager>\\.requestClient,\\k<manager>\\.logger,\\k<model>,async\\(\\)=>\\{`,
         `if\\("local"===\\k<manager>\\.getHostId\\(\\)&&await \\k<runtime>\\.isUsingCopilotInference\\(\\)\\)return!1;`,
         `let (?<result>${id})=await \\k<manager>\\.getAccount\\(\\{priority:"critical"\\}\\);`,
         `return (?<gate>\\k<result>\\.account\\?\\.type==="chatgpt"(?:\\|\\|\\k<result>\\.account\\?\\.type===${literal})*)\\}\\)\\},async writeServiceTier\\(`,
@@ -43,24 +42,19 @@
     },
     {
       kind: "queue-explicit-access",
-      pattern: [
+      // 26.1103 将读取档位的闭包内联进 Promise.all；两种结构分别匹配，合并计数。
+      patterns: [
+        [`let (?<readTier>${id})=async\\(\\)=>\\{`, `\\},\\[${id},${id}\\]=await Promise\\.all\\(\\[\\k<readTier>\\(\\),`],
+        [`let\\[${id},${id}\\]=await Promise\\.all\\(\\[\\(async\\(\\)=>\\{`, `\\}\\)\\(\\),`],
+      ].map(([start, end]) => [
         `function\\((?<manager>${id}),\\{settings:(?<settings>${id}),storage:${id},filesystem:${id},runtime:(?<runtime>${id})\\},(?<readDefault>${id}),${id},${id}\\)\\{`,
         `return async\\(${id},(?<message>${id})\\)=>\\{let (?<options>${id})=\\k<message>\\.submissionOptions,${id}=\\k<message>\\.context\\.workPermissions,${id}=null!=${id},`,
         `(?<host>${id})=\\k<options>\\?\\.executionHostId\\?\\?\\k<manager>\\.getHostId\\(\\);`,
-        `[^]{0,2400}?let (?<readTier>${id})=async\\(\\)=>\\{if\\(null==\\k<options>\\)return \\k<readDefault>\\(${id}\\?\\.latestModel\\|\\|null\\);`,
+        `[^]{0,2400}?${start}if\\(null==\\k<options>\\)return \\k<readDefault>\\(${id}\\?\\.latestModel\\|\\|null\\);`,
         `if\\(null==\\k<options>\\.serviceTier\\)return null;let\\{account:(?<account>${id})\\}=await \\k<manager>\\.getAccount\\(\\{priority:"critical"\\}\\);`,
-        `return (?<gate>\\k<account>\\?\\.type==="chatgpt"(?:\\|\\|\\k<account>\\?\\.type===${literal})*)\\?\\k<options>\\.serviceTier:null\\},\\[${id},${id}\\]=await Promise\\.all\\(\\[\\k<readTier>\\(\\),\\k<options>\\?\\.usePermissionSelection\\?\\?\\k<settings>\\.readPermissionRefreshEnabled\\(\\)\\]\\)`,
-      ].join(""),
+        `return (?<gate>\\k<account>\\?\\.type==="chatgpt"(?:\\|\\|\\k<account>\\?\\.type===${literal})*)\\?\\k<options>\\.serviceTier:null${end}\\k<options>\\?\\.usePermissionSelection\\?\\?\\k<settings>\\.readPermissionRefreshEnabled\\(\\)\\]\\)`,
+      ].join("")),
       distinct: ["manager", "host", "runtime", "account"],
-      patterns: [[
-        // 26.1103 把临时 readTier 变量重新内联进 Promise.all。
-        `function\\((?<manager>${id}),\\{settings:(?<settings>${id}),storage:${id},filesystem:${id},runtime:(?<runtime>${id})\\},(?<readDefault>${id}),${id},${id}\\)\\{`,
-        `return async\\(${id},(?<message>${id})\\)=>\\{let (?<options>${id})=\\k<message>\\.submissionOptions,${id}=\\k<message>\\.context\\.workPermissions,${id}=null!=${id},`,
-        `(?<host>${id})=\\k<options>\\?\\.executionHostId\\?\\?\\k<manager>\\.getHostId\\(\\);`,
-        `[^]{0,2400}?let\\[${id},${id}\\]=await Promise\\.all\\(\\[\\(async\\(\\)=>\\{if\\(null==\\k<options>\\)return \\k<readDefault>\\(${id}\\?\\.latestModel\\|\\|null\\);`,
-        `if\\(null==\\k<options>\\.serviceTier\\)return null;let\\{account:(?<account>${id})\\}=await \\k<manager>\\.getAccount\\(\\{priority:"critical"\\}\\);`,
-        `return (?<gate>\\k<account>\\?\\.type==="chatgpt"(?:\\|\\|\\k<account>\\?\\.type===${literal})*)\\?\\k<options>\\.serviceTier:null\\}\\)\\(\\),\\k<options>\\?\\.usePermissionSelection\\?\\?\\k<settings>\\.readPermissionRefreshEnabled\\(\\)\\]\\)`,
-      ].join("")],
       replacement: g => `(${g.gate}||${g.host}==="local"&&${allow(`${g.manager}.getHostId()`, `${g.account}?.type`)}&&typeof ${g.runtime}.isUsingCopilotInference==="function"&&!(await ${g.runtime}.isUsingCopilotInference()))`,
     },
   ];
@@ -113,9 +107,8 @@
     }
     const replacements = new Map();
     for (const gate of gates) {
-      const matches = factories.flatMap(factory => [gate.pattern, ...(gate.patterns ?? [])]
-        .flatMap(pattern => [...factory.source.matchAll(new RegExp(pattern, "g"))]
-          .map(match => ({ factory, match }))));
+      const matches = factories.flatMap(factory => (gate.patterns ?? [gate.pattern]).flatMap(pattern =>
+        [...factory.source.matchAll(new RegExp(pattern, "g"))].map(match => ({ factory, match }))));
       diagnostics.matches[gate.kind] = matches.length;
       if (matches.length !== 1) continue;
       const { factory, match } = matches[0];
@@ -150,9 +143,8 @@
   function registrationChunk(source, url) {
     if (!isRuntime(source)) return null;
     const register = new RegExp(`(?<chunk>${id})\\.__rspack_esm_ids,(?<modules>${id})=\\k<chunk>\\.__webpack_modules__,${id}=\\k<chunk>\\.__rspack_esm_runtime,${id}=0;for\\((?<key>${id}) in \\k<modules>\\)(?<require>${id})\\.o\\(\\k<modules>,\\k<key>\\)&&\\((?<assignment>\\k<require>\\.m\\[\\k<key>\\]=\\k<modules>\\[\\k<key>\\])\\)`, "g");
-    // 26.1103 把模块注册、runtime 回调移到 chunk id 循环之前。
-    // 仍要求模块赋值和回调都使用同一 require，不按混淆后的函数名定位。
-    const reordered = new RegExp(`(?<modules>${id})=(?<chunk>${id})\\.__webpack_modules__,(?<runtime>${id})=\\k<chunk>\\.__rspack_esm_runtime;for\\((?<key>${id}) in \\k<modules>\\)(?<require>${id})\\.o\\(\\k<modules>,\\k<key>\\)&&\\((?<assignment>\\k<require>\\.m\\[\\k<key>\\]=\\k<modules>\\[\\k<key>\\])\\);\\k<runtime>&&\\k<runtime>\\(\\k<require>\\);for\\(var ${id}=\\k<chunk>\\.__rspack_esm_ids,`, "g");
+    // 26.1103 在注册工厂、执行 runtime 后才读取 chunk ids，保留旧顺序的兼容性。
+    const reordered = new RegExp(`(?<chunk>${id})=>\\{var (?<key>${id}),(?<modules>${id})=\\k<chunk>\\.__webpack_modules__,(?<runtime>${id})=\\k<chunk>\\.__rspack_esm_runtime;for\\(\\k<key> in \\k<modules>\\)(?<require>${id})\\.o\\(\\k<modules>,\\k<key>\\)&&\\(\\k<require>\\.m\\[\\k<key>\\]=\\k<modules>\\[\\k<key>\\]\\);\\k<runtime>&&\\k<runtime>\\(\\k<require>\\);for\\(var ${id}=\\k<chunk>\\.__rspack_esm_ids,${id}=0;`, "g");
     const registrations = [...source.matchAll(register), ...source.matchAll(reordered)];
     if (registrations.length !== 1) return null;
     const { groups: g } = registrations[0];

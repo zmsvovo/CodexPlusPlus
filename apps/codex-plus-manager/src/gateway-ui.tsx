@@ -1,5 +1,5 @@
 /** 本地网关页各标签共用的小组件与类型。 */
-import type { CSSProperties, ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { KeyRound, Shuffle, Waypoints } from "lucide-react";
 import { t, tf } from "./i18n";
@@ -9,6 +9,7 @@ import {
   maskAccountName,
   maskAccountText,
   quotaRemaining,
+  quotaWindowFresh,
   quotaWindowLabel,
   type GatewayResult,
   type MemberStatus,
@@ -114,7 +115,7 @@ export function agentIconIsColor(agent: string): boolean {
 export function AgentIcon({ agent, className = "" }: { agent: string; className?: string }) {
   if (agent === "codex") return <img alt="" className={className} src={AGENT_ICONS.codexApp} />;
   const url = AGENT_ICONS[agent];
-  if (url && agentIconIsColor(agent)) return <img alt="" className={className} src={url} />;
+  if (url && agentIconIsColor(agent)) return <img alt="" className={className} data-agent-icon={agent} src={url} />;
   // 通用 Agent 没有打包图标：用名字首字母。
   if (!url) return <i aria-hidden="true" className={`${className} gw-agent-letter`.trim()}>{(agentName(agent).trim()[0] ?? "?").toUpperCase()}</i>;
   return <i aria-hidden="true" className={`${className} gw-agent-mono`.trim()} style={url ? ({ "--gw-agent-icon": `url("${url}")` } as CSSProperties) : undefined} />;
@@ -138,7 +139,7 @@ export function Avatar({ name, baseUrl = "", size = "md", plain = false }: { nam
   const url = key ? BRAND_ICON_URLS[key] : undefined;
   if (key && url) {
     return (
-      <span className="gw-avatar gw-avatar-brand" data-size={size} title={maskAccountName(name)}>
+      <span className="gw-avatar gw-avatar-brand" data-brand={key} data-size={size} title={maskAccountName(name)}>
         {brandIconIsColor(key) ? <img alt="" src={url} /> : <i className="gw-mono-icon" style={{ "--gw-icon": `url("${url}")` } as CSSProperties} />}
       </span>
     );
@@ -150,9 +151,33 @@ export function Avatar({ name, baseUrl = "", size = "md", plain = false }: { nam
   );
 }
 
-export function Switch({ on, disabled, label, onToggle }: { on: boolean; disabled?: boolean; label: string; onToggle: () => void }) {
+/**
+ * `disabled`：长期不可用（灰色）。
+ * `pending`：页面上有保存在进行（#2973）。此时只拦点击、不变灰，避免整页开关一起闪；
+ * 被点的那个先乐观显示新状态，保存结束后以最新数据为准（失败即回滚）。
+ */
+export function Switch({ on, disabled, pending, label, onToggle }: { on: boolean; disabled?: boolean; pending?: boolean; label: string; onToggle: () => void }) {
+  const [optimistic, setOptimistic] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!pending) setOptimistic(null);
+  }, [pending, on]);
+  const shown = optimistic ?? on;
   return (
-    <button aria-checked={on} aria-label={label} className={`gw-switch ${on ? "is-on" : ""}`} disabled={disabled} onClick={onToggle} role="switch" type="button">
+    <button
+      aria-checked={shown}
+      aria-disabled={pending || undefined}
+      aria-label={label}
+      className={`gw-switch ${shown ? "is-on" : ""}`}
+      data-pending={pending ? "true" : undefined}
+      disabled={disabled}
+      onClick={() => {
+        if (pending) return;
+        setOptimistic(!on);
+        onToggle();
+      }}
+      role="switch"
+      type="button"
+    >
       <span />
     </button>
   );
@@ -199,6 +224,9 @@ export function KeyCount({ count }: { count: number }) {
 
 /** 订阅额度的剩余量：一根细条 + 百分比，取最紧的窗口。 */
 export function QuotaBadge({ quota }: { quota: ProviderQuota }) {
+  if (quota.officialAllowed === false) return <span className="gw-muted">{t("订阅额度受限")}</span>;
+  if (!quota.windows.length) return <span className="gw-muted">{quota.windowsComplete && quota.officialAllowed === true ? t("官方未返回时间窗口") : t("额度待刷新")}</span>;
+  if (quota.windows.some(window => !quotaWindowFresh(quota, window, Date.now()))) return <span className="gw-muted">{t("额度待刷新")}</span>;
   const left = Math.round(quotaRemaining(quota, Date.now()) * 100);
   const tone = left <= 10 ? "low" : left <= 30 ? "mid" : "ok";
   return (
@@ -209,21 +237,25 @@ export function QuotaBadge({ quota }: { quota: ProviderQuota }) {
   );
 }
 
-/** 订阅额度的明细：每个窗口一行，已用比例和重置时间。 */
-export function QuotaWindows({ quota }: { quota: ProviderQuota }) {
+/** 官方实际返回的窗口；卡片与详情共用，未知读数不显示为恢复。 */
+export function QuotaWindows({ quota, compact = false, maxAgeSeconds = 600 }: { quota: ProviderQuota; compact?: boolean; maxAgeSeconds?: number }) {
   const now = Date.now();
+  const fresh = quota.updatedAtMs <= now && now - quota.updatedAtMs <= maxAgeSeconds * 1000;
+  if (!quota.windows.length) return <span className="gw-muted">{fresh && quota.officialAllowed === false ? t("订阅额度受限") : fresh && quota.windowsComplete && quota.officialAllowed === true ? t("官方未返回时间窗口") : t("额度待刷新")}</span>;
   return (
-    <span className="gw-quota-windows">
+    <span className="gw-quota-windows" data-compact={compact || undefined}>
       {quota.windows.map((window, index) => {
         const reset = window.resetsAtMs !== null && window.resetsAtMs > now ? formatRemaining(window.resetsAtMs - now) : "";
         const label = quotaWindowLabel(window);
-        const used = window.resetsAtMs !== null && window.resetsAtMs <= now ? 0 : Math.round(window.usedPercent);
+        const known = quotaWindowFresh(quota, window, now, maxAgeSeconds);
+        const used = Math.round(window.usedPercent);
+        const name = window.windowMinutes === 300 ? "5h" : window.windowMinutes === 10080 ? "7d" : label.args.length ? tf(label.text, label.args) : t(label.text);
         return (
-          <span className="gw-quota-window" data-tone={used >= 90 ? "low" : used >= 70 ? "mid" : "ok"} key={index}>
-            <b>{label.args.length ? tf(label.text, label.args) : t(label.text)}</b>
-            <i style={{ "--gw-quota": `${Math.max(0, 100 - used)}%` } as CSSProperties} />
-            <span>{tf("已用 {0}%", [used])}</span>
-            {reset ? <small>{tf("{0} 后重置", [reset])}</small> : null}
+          <span className="gw-quota-window" data-tone={!known ? "unknown" : used >= 90 ? "low" : used >= 70 ? "mid" : "ok"} key={index} title={reset ? tf("{0} 后重置", [reset]) : undefined}>
+            <b>{name}</b>
+            <i aria-hidden="true" style={{ "--gw-quota": known ? `${Math.max(0, Math.min(100, used))}%` : "0%" } as CSSProperties} />
+            <span>{known ? tf("已用 {0}%", [used]) : t("待刷新")}</span>
+            {!compact && reset ? <small>{tf("{0} 后重置", [reset])}</small> : null}
           </span>
         );
       })}
@@ -254,5 +286,9 @@ export function ModelViewGlyph({ view }: { view: ModelView }) {
 
 /** 模型名后的「自动」小标签：多家自动切换时显示，悬停列出按顺序尝试的几家。 */
 export function AutoTag({ view }: { view: ModelView }) {
+  if (view.issue) {
+    const label = view.issue === "invalid" ? "模型身份不可用" : view.issue === "conflict" ? "模型名冲突" : "供应商不可用";
+    return <em className="gw-auto-tag" title={t("请重新选择默认模型")}>{t(label)}</em>;
+  }
   return view.auto ? <em className="gw-auto-tag" title={view.sub}>{t("自动")}</em> : null;
 }

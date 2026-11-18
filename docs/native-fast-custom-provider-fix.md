@@ -102,3 +102,13 @@ Windows Release 提供 `CodexPlusPlus-<version>-windows-x64-portable.exe`；fork
 验证命令：
 - cargo test --release -p codex-plus-core --lib --test all native_fast --locked
 - cargo test --release -p codex-plus-core --test all updater:: --locked
+
+## 2026-11-18：Codex++ 2.7.2-fork.1 / GPT-6.2-Sol Ultra Fast
+
+同步正式标签 v2.7.2（70fb845e）。GPT-6.2-Sol 的兼容元数据声明 `priority` 和
+`ultrafast`；托管模型目录及原生选择器采用相同档位。普通 Fast、Ultra Fast 和推理强度
+里的 Ultra 是不同选项，不改变当前会话的默认档位。
+
+Codex 26.1111.2228.0 安装包中的四个原生门控均唯一匹配。隔离运行的同版本
+app-server 向本机模拟接口实际发送了 `POST /v1/responses`，模型为 `gpt-6.2-sol`，
+`service_tier` 为 `ultrafast`。该验证不涉及付费服务商或实际加速效果。

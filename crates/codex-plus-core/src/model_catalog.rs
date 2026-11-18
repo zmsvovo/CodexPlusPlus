@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use crate::settings::{RelayProfile, SettingsStore};
+use crate::settings::{BackendSettings, RelayProfile, SettingsStore};
 use serde_json::{Map, Value, json};
 
 const BASE_URL_ENV_KEYS: &[&str] = &[
@@ -38,14 +39,21 @@ struct CodexConfig {
     root: HashMap<String, String>,
     profiles: HashMap<String, HashMap<String, String>>,
     model_providers: HashMap<String, HashMap<String, String>>,
+    effective_model: String,
 }
 
 pub async fn read_codex_model_catalog() -> Value {
     let home = codex_home_dir();
     let settings_path = crate::paths::default_settings_path();
+    let mut loaded_settings = None;
     if settings_path.exists() {
         if let Ok(settings) = SettingsStore::new(settings_path).load() {
             let profile = settings.active_relay_profile();
+            if profile.id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID
+                && let Some(catalog) = live_gateway_model_catalog(&home, &profile)
+            {
+                return model_catalog_with_prices(catalog, Some(&settings), &home);
+            }
             let catalog = if let Some(aggregate) = crate::aggregate_catalog::active_model_aggregation(&settings) {
                 crate::aggregate_catalog::catalog_summary(&home, &settings, &aggregate)
                     .unwrap_or_else(|_| relay_profile_model_catalog_value(&home, &profile))
@@ -57,8 +65,9 @@ pub async fn read_codex_model_catalog() -> Value {
                 .and_then(Value::as_array)
                 .map_or(false, |m| !m.is_empty())
             {
-                return catalog;
+                return model_catalog_with_prices(catalog, Some(&settings), &home);
             }
+            loaded_settings = Some(settings);
         }
     }
     let env = std::env::vars_os()
@@ -70,12 +79,13 @@ pub async fn read_codex_model_catalog() -> Value {
     let client = match crate::http_client::proxied_client("CodexPlusPlus/1.0") {
         Ok(client) => client,
         Err(error) => {
-            return json!({
+            return model_catalog_with_prices(json!({
                 "status": "failed",
                 "path": home.join("config.toml").to_string_lossy(),
                 "message": error.to_string(),
                 "service_tier": config_service_tier_value(&home),
                 "model": "",
+                "effective_config_model": "",
                 "model_provider": "",
                 "provider_name": "",
                 "default_model": "",
@@ -83,15 +93,367 @@ pub async fn read_codex_model_catalog() -> Value {
                 "modelMetadata": {},
                 "sources": [],
                 "responses_api": responses_api_status("unknown", "", "")
-            });
+            }), loaded_settings.as_ref(), &home);
         }
     };
-    read_codex_model_catalog_from_home(&home, &env, client).await
+    let catalog = read_codex_model_catalog_from_home(&home, &env, client).await;
+    model_catalog_with_prices(catalog, loaded_settings.as_ref(), &home)
+}
+
+fn gateway_catalog_config(home: &Path) -> Option<(CodexConfig, HashMap<String, String>, PathBuf)> {
+    let (config, effective, _) = load_codex_config(&home.join("config.toml"));
+    let path = resolve_config_path(home, effective.get("model_catalog_json")?);
+    path.ends_with("model-catalogs/codex-plus-gateway.json")
+        .then_some((config, effective, path))
+}
+
+/// 网关多开实例使用管理器发布的同一份模型目录。
+pub fn gateway_catalog_path(home: &Path) -> Option<PathBuf> {
+    gateway_catalog_config(home).map(|(_, _, path)| path)
+}
+
+pub(crate) fn gateway_catalog_revision(home: &Path) -> Option<u64> {
+    let (_, _, path) = gateway_catalog_config(home)?;
+    let content = std::fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+fn live_gateway_model_catalog(home: &Path, profile: &RelayProfile) -> Option<Value> {
+    let (config, effective, _) = gateway_catalog_config(home)?;
+    let (models, metadata, source) = models_from_config_model_catalog_json(home, &effective);
+    let source = source.expect("managed gateway catalog pointer is present");
+    let model = models.iter().find(|model| **model == config.effective_model).or_else(|| models.first());
+    Some(json!({
+        "status": source["status"],
+        "message": source["message"],
+        "path": home.join("config.toml").to_string_lossy(),
+        "service_tier": service_tier_value(&effective),
+        "model": model.map(String::as_str).unwrap_or_default(),
+        "effective_config_model": config.effective_model,
+        "model_provider": profile.id,
+        "codex_model_provider": effective.get("model_provider"),
+        "provider_name": profile.name,
+        "default_model": model.map(String::as_str).unwrap_or_default(),
+        "models": models,
+        "modelMetadata": metadata,
+        "sources": [source],
+        "responses_api": responses_api_status("unknown", "", "")
+    }))
+}
+
+/// 给目录里每个模型附上公开价格表的单价（`codex_plus_price`），前端模型选择器按它画价格条。
+/// 只读本地缓存的价格表，不阻塞路由；没有缓存时后台预热，本次不带价格。
+fn model_catalog_with_prices(mut catalog: Value, settings: Option<&BackendSettings>, home: &Path) -> Value {
+    catalog["runtimeContext"] = runtime_context_value(home).unwrap_or_else(|error| {
+        json!({ "status": "failed", "message": format!("{error:#}") })
+    });
+    apply_model_price_overlay(&mut catalog, settings);
+    catalog
+}
+
+fn runtime_context_value(home: &Path) -> anyhow::Result<Value> {
+    let config_path = home.join("config.toml");
+    let config_text = match std::fs::read_to_string(&config_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
+        Err(error) => return Err(error).context("读取运行时上下文配置失败"),
+    };
+    let config: toml::Value = toml::from_str(&config_text).context("解析运行时上下文配置失败")?;
+    let Some(pointer) = config.get("model_catalog_json").and_then(toml::Value::as_str) else {
+        return Ok(Value::Null);
+    };
+    if !crate::relay_config::is_codex_plus_managed_model_catalog(home, pointer) {
+        return Ok(Value::Null);
+    }
+    let catalog_path = Path::new(pointer);
+    let catalog_path = if catalog_path.is_absolute() {
+        catalog_path.to_path_buf()
+    } else {
+        home.join(catalog_path)
+    };
+    let catalog_text = std::fs::read_to_string(catalog_path).context("读取受管运行时模型目录失败")?;
+    let catalog: Value = serde_json::from_str(&catalog_text).context("解析受管运行时模型目录失败")?;
+    let models = catalog.get("models").and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("受管运行时模型目录缺少 models 数组"))?;
+    if models.iter().any(|model| model.get("max_context_window").is_some_and(|value| !value.is_null())) {
+        return Ok(json!({
+            "status": "unsupported",
+            "message": "当前受管模型目录仍含启动时窗口上限，无法保证运行中调大上下文窗口"
+        }));
+    }
+    let root_window = config.get("model_context_window")
+        .map(|value| value.as_integer().context("model_context_window 必须为整数"))
+        .transpose()?;
+    let root_compact = config.get("model_auto_compact_token_limit")
+        .map(|value| value.as_integer().context("model_auto_compact_token_limit 必须为整数"))
+        .transpose()?;
+    let mut contexts = Map::new();
+    for model in models {
+        let slug = model.get("slug").and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("受管运行时模型目录缺少模型 slug"))?;
+        let window = root_window.or_else(|| model.get("context_window").and_then(Value::as_i64))
+            .filter(|window| *window > 0)
+            .ok_or_else(|| anyhow::anyhow!("模型 {slug} 缺少有效上下文窗口"))?;
+        let compact = root_compact
+            .or_else(|| model.get("auto_compact_token_limit").and_then(Value::as_i64))
+            .unwrap_or_else(|| ((window as i128 * 9) / 10) as i64);
+        contexts.insert(slug.to_string(), json!({
+            "model_context_window": window,
+            "model_auto_compact_token_limit": compact
+        }));
+    }
+    Ok(json!({ "status": "ok", "models": contexts }))
+}
+
+#[cfg(test)]
+mod runtime_context_tests {
+    use super::*;
+
+    #[test]
+    fn gateway_catalog_reads_live_models_instead_of_worker_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("model-catalogs/codex-plus-gateway.json");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "model = 'old'\nmodel_provider = 'custom'\nmodel_catalog_json = 'model-catalogs/codex-plus-gateway.json'\n").unwrap();
+        let profile = RelayProfile {
+            id: crate::gateway::apply::CODEX_GATEWAY_RELAY_ID.into(),
+            model: "old".into(),
+            model_list: "old\nremoved".into(),
+            ..RelayProfile::default()
+        };
+        std::fs::write(&path, r#"{"models":[{"slug":"old"}]}"#).unwrap();
+        let revision = gateway_catalog_revision(home.path()).unwrap();
+        std::fs::write(&path, r#"{"models":[{"slug":"added","codex_plus_group_id":"new-provider"},{"slug":"hidden","visibility":"hide"}]}"#).unwrap();
+        let catalog = live_gateway_model_catalog(home.path(), &profile).unwrap();
+        assert_eq!(catalog["models"], json!(["added"]));
+        assert_eq!(catalog["model"], "added");
+        assert_eq!(catalog["model_provider"], profile.id);
+        assert_eq!(catalog["modelMetadata"]["added"]["codex_plus_group_id"], "new-provider");
+        assert_ne!(gateway_catalog_revision(home.path()).unwrap(), revision);
+        std::fs::write(&path, "invalid catalog").unwrap();
+        assert_eq!(live_gateway_model_catalog(home.path(), &profile).unwrap()["status"], "failed");
+    }
+
+    #[test]
+    fn gateway_catalog_reads_shared_manager_catalog_from_instance_home() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("instance");
+        let path = root.path().join("manager/model-catalogs/codex-plus-gateway.json");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(home.join("config.toml"), format!(
+            "model = 'old'\nmodel_catalog_json = '{}'\n", path.display()
+        )).unwrap();
+        std::fs::write(&path, r#"{"models":[{"slug":"old"}]}"#).unwrap();
+        let profile = RelayProfile {
+            id: crate::gateway::apply::CODEX_GATEWAY_RELAY_ID.into(),
+            ..RelayProfile::default()
+        };
+        let before = gateway_catalog_revision(&home).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let modified = metadata.modified().unwrap();
+        std::fs::write(&path, r#"{"models":[{"slug":"new"}]}"#).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+        let updated = std::fs::metadata(&path).unwrap();
+        assert_eq!(updated.modified().unwrap(), modified);
+        assert_eq!(updated.len(), metadata.len());
+        assert_eq!(live_gateway_model_catalog(&home, &profile).unwrap()["models"], json!(["new"]));
+        assert_ne!(gateway_catalog_revision(&home).unwrap(), before);
+    }
+
+    #[test]
+    fn runtime_context_uses_live_managed_catalog_defaults_and_explicit_compaction() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("model-catalogs")).unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model_catalog_json = 'model-catalogs/live.json'\n",
+        ).unwrap();
+        for max in [Some(Value::Null), None] {
+            let mut model = json!({
+                "slug": "model-a",
+                "context_window": 131072,
+                "auto_compact_token_limit": null,
+                "effective_context_window_percent": 95
+            });
+            if let Some(max) = max {
+                model["max_context_window"] = max;
+            }
+            std::fs::write(
+                home.path().join("model-catalogs/live.json"),
+                json!({ "models": [model, {
+                    "slug": "model-b",
+                    "context_window": 262144,
+                    "auto_compact_token_limit": 100000
+                }] }).to_string(),
+            ).unwrap();
+            let context = runtime_context_value(home.path()).unwrap();
+            assert_eq!(context["status"], "ok");
+            assert_eq!(context["models"]["model-a"]["model_context_window"], 131072);
+            // 原生 auto compact 基于原始窗口；95% 只影响可用上下文，不重复打折。
+            assert_eq!(context["models"]["model-a"]["model_auto_compact_token_limit"], 117964);
+            assert_eq!(context["models"]["model-b"]["model_auto_compact_token_limit"], 100000);
+        }
+    }
+
+    #[test]
+    fn runtime_context_preserves_live_root_single_value_overrides() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("model-catalogs")).unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model_catalog_json = 'model-catalogs/live.json'\nmodel_context_window = 400000\nmodel_auto_compact_token_limit = 300000\n",
+        ).unwrap();
+        std::fs::write(
+            home.path().join("model-catalogs/live.json"),
+            r#"{"models":[{"slug":"model-a","context_window":131072,"max_context_window":null,"auto_compact_token_limit":100000}]}"#,
+        ).unwrap();
+        assert_eq!(runtime_context_value(home.path()).unwrap()["models"]["model-a"], json!({
+            "model_context_window": 400000,
+            "model_auto_compact_token_limit": 300000
+        }));
+    }
+
+    #[test]
+    fn runtime_context_rejects_legacy_clamp_and_reports_managed_file_errors() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("model-catalogs")).unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model_catalog_json = 'model-catalogs/live.json'\n",
+        ).unwrap();
+        assert_eq!(
+            model_catalog_with_prices(json!({}), None, home.path())["runtimeContext"]["status"],
+            "failed"
+        );
+        std::fs::write(home.path().join("model-catalogs/live.json"), "{bad").unwrap();
+        assert_eq!(
+            model_catalog_with_prices(json!({}), None, home.path())["runtimeContext"]["status"],
+            "failed"
+        );
+        std::fs::write(
+            home.path().join("model-catalogs/live.json"),
+            r#"{"models":[{"slug":"model-a","context_window":131072,"max_context_window":131072}]}"#,
+        ).unwrap();
+        assert_eq!(runtime_context_value(home.path()).unwrap()["status"], "unsupported");
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model_catalog_json = 'external.json'\n",
+        ).unwrap();
+        // 不读取或接管外部目录，即使其内容无效。
+        std::fs::write(home.path().join("external.json"), "{bad").unwrap();
+        assert!(runtime_context_value(home.path()).unwrap().is_null());
+    }
+}
+
+fn apply_model_price_overlay(catalog: &mut Value, settings: Option<&BackendSettings>) {
+    let catalog_provider = catalog
+        .get("model_provider")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let Some(metadata) = catalog
+        .get_mut("modelMetadata")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if metadata.is_empty() {
+        return;
+    }
+    let Some(prices) = crate::model_pricing::cached_catalog() else {
+        warm_price_catalog();
+        return;
+    };
+    overlay_prices(metadata, &prices, |group_id| {
+        group_base_url(settings, &catalog_provider, group_id)
+    });
+}
+
+/// 模型归属供应商的请求地址：聚合条目用成员的 base_url 查成员自己的价目，
+/// 其他（单供应商目录、官方目录）落到目录级 `model_provider` 对应的 profile。
+fn group_base_url(
+    settings: Option<&BackendSettings>,
+    catalog_provider: &str,
+    group_id: &str,
+) -> String {
+    let wanted = if group_id.trim().is_empty() {
+        catalog_provider.trim()
+    } else {
+        group_id.trim()
+    };
+    if wanted.is_empty() {
+        return String::new();
+    }
+    settings
+        .and_then(|settings| {
+            settings
+                .relay_profiles
+                .iter()
+                .find(|profile| profile.id == wanted)
+        })
+        .map(|profile| profile.base_url.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// 条目对应的上游模型名：聚合成员的 slug 是 `cpx-<成员>/<上游>`，剥掉成员前缀；
+/// 默认成员的 slug 本来就是裸名，`[1M]` 这类窗口后缀交给查价的候选名处理。
+fn entry_upstream_model<'a>(slug: &'a str, group_id: &str) -> &'a str {
+    if group_id.trim().is_empty() {
+        return slug;
+    }
+    let prefix = crate::aggregate_catalog::aggregate_model_id(group_id, "");
+    slug.strip_prefix(&prefix).unwrap_or(slug)
+}
+
+fn overlay_prices(
+    metadata: &mut Map<String, Value>,
+    prices: &crate::model_pricing::PriceCatalog,
+    base_url_for: impl Fn(&str) -> String,
+) {
+    for (slug, entry) in metadata.iter_mut() {
+        let Some(entry) = entry.as_object_mut() else { continue };
+        let group_id = entry
+            .get("codex_plus_group_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let upstream = entry_upstream_model(slug, group_id);
+        let Some(found) = prices.lookup(&base_url_for(group_id), upstream) else {
+            continue;
+        };
+        entry.insert(
+            "codex_plus_price".to_string(),
+            json!({
+                "input": found.input,
+                "cachedInput": found.cached_input,
+                "output": found.output,
+                "currency": found.currency,
+                "provider": found.provider_name,
+                "source": "models.dev"
+            }),
+        );
+    }
+}
+
+/// 缓存缺失时后台拉一次价格表：本次响应不带价格，下次打开选择器就有了。
+fn warm_price_catalog() {
+    static WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARMING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        let _ = crate::model_pricing::load_catalog(false).await;
+        WARMING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Value {
     let models = relay_profile_model_ids(profile);
     let model = profile.model.trim().to_string();
+    let (live_config, _, _) = load_codex_config(&home.join("config.toml"));
     let codex_model_provider = codex_model_provider_for_relay_profile(home, profile);
     let configured_model = crate::relay_config::relay_profile_model(profile);
     let default_model = if models.iter().any(|item| item == &configured_model) {
@@ -111,6 +473,7 @@ fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Val
         "path": home.join("config.toml").to_string_lossy(),
         "service_tier": config_service_tier_value(home),
         "model": model,
+        "effective_config_model": live_config.effective_model,
         "model_provider": profile.id.trim(),
         "codex_model_provider": codex_model_provider,
         "provider_name": provider_name,
@@ -130,6 +493,40 @@ fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Val
         ],
         "responses_api": responses_api_status("unknown", "", "")
     })
+}
+
+/// 只报告实际配置中显式声明的模型，并考虑当前启用的 profile。
+pub(crate) fn effective_config_model(contents: &str) -> String {
+    let Ok(config) = contents.parse::<toml::Value>() else {
+        return String::new();
+    };
+    let Some(root) = config.as_table() else {
+        return String::new();
+    };
+    let profile = match root.get("profile") {
+        Some(profile) => {
+            let Some(profile) = profile.as_str() else {
+                return String::new();
+            };
+            let Some(profile) = root
+                .get("profiles")
+                .and_then(toml::Value::as_table)
+                .and_then(|profiles| profiles.get(profile))
+                .and_then(toml::Value::as_table)
+            else {
+                return String::new();
+            };
+            Some(profile)
+        }
+        None => None,
+    };
+    profile
+        .and_then(|profile| profile.get("model"))
+        .or_else(|| root.get("model"))
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn codex_model_provider_for_relay_profile(home: &Path, profile: &RelayProfile) -> String {
@@ -335,6 +732,7 @@ pub async fn read_codex_model_catalog_from_home(
             "message": error,
             "service_tier": service_tier_value(&effective),
             "model": model,
+            "effective_config_model": config.effective_model,
             "model_provider": model_provider,
             "provider_name": provider_name,
             "default_model": "",
@@ -365,7 +763,8 @@ pub async fn read_codex_model_catalog_from_home(
         models.extend(source_models);
         source_statuses.push(source_status);
     }
-    let (catalog_models, catalog_status) = models_from_config_model_catalog_json(home, &effective);
+    let (catalog_models, catalog_metadata, catalog_status) =
+        models_from_config_model_catalog_json(home, &effective);
     models.extend(catalog_models);
     if let Some(status) = catalog_status {
         source_statuses.push(status);
@@ -394,13 +793,17 @@ pub async fn read_codex_model_catalog_from_home(
         "not_configured"
     };
     let responses_api = preferred_responses_api_status(&source_statuses);
-    let model_metadata = model_ui_metadata_map(&models);
+    let mut model_metadata = model_ui_metadata_map(&models);
+    for (model, fields) in catalog_metadata {
+        model_metadata[model] = fields;
+    }
 
     json!({
         "status": status,
         "path": config_path.to_string_lossy(),
         "service_tier": service_tier_value(&effective),
         "model": model,
+        "effective_config_model": config.effective_model,
         "model_provider": model_provider,
         "provider_name": provider_name,
         "default_model": default_model,
@@ -459,7 +862,10 @@ fn load_codex_config(path: &Path) -> (CodexConfig, HashMap<String, String>, Opti
 }
 
 fn parse_codex_config(contents: &str) -> CodexConfig {
-    let mut config = CodexConfig::default();
+    let mut config = CodexConfig {
+        effective_model: effective_config_model(contents),
+        ..CodexConfig::default()
+    };
     let mut section = ConfigSection::Root;
     for line in contents.lines() {
         let trimmed = line.trim();
@@ -993,16 +1399,23 @@ async fn fetch_official_login_model_ids(
     let credential = crate::official_login::resolve_official_credential(profile, false).await?;
     let base = crate::official_login::official_base_url();
     let endpoint = format!("{}/models", base.trim().trim_end_matches('/'));
+    let version = crate::gateway::chatgpt_backend::codex_version(
+        &crate::codex_home::default_codex_home_dir(),
+    );
     let client = crate::http_client::proxied_client_for_relay(&profile.user_agent, &profile)?;
     let mut request = client
         .get(&endpoint)
-        .query(&[("client_version", OFFICIAL_MODELS_CLIENT_VERSION)])
+        .query(&[("client_version", version.as_str())])
         .header(
             reqwest::header::AUTHORIZATION,
             format!("Bearer {}", credential.access_token.trim()),
         )
         .header("originator", "codex_cli_rs")
-        .header("version", OFFICIAL_MODELS_CLIENT_VERSION)
+        .header("version", &version)
+        .header(
+            reqwest::header::USER_AGENT,
+            crate::gateway::chatgpt_backend::codex_user_agent(&version),
+        )
         .timeout(MODELS_FETCH_TIMEOUT);
     if !credential.account_id.trim().is_empty() {
         request = request.header("chatgpt-account-id", credential.account_id.trim());
@@ -1156,10 +1569,10 @@ fn model_id_from_field<'a>(key: &str, value: &'a str) -> &'a str {
 fn models_from_config_model_catalog_json(
     home: &Path,
     effective: &HashMap<String, String>,
-) -> (Vec<String>, Option<Value>) {
+) -> (Vec<String>, Map<String, Value>, Option<Value>) {
     let raw_path = string_value(effective.get("model_catalog_json"));
     if raw_path.is_empty() {
-        return (Vec::new(), None);
+        return (Vec::new(), Map::new(), None);
     }
     let path = resolve_config_path(home, &raw_path);
     let safe_path = path.to_string_lossy().to_string();
@@ -1168,6 +1581,7 @@ fn models_from_config_model_catalog_json(
         Err(error) => {
             return (
                 Vec::new(),
+                Map::new(),
                 Some(json!({
                     "id": "config:model_catalog_json",
                     "type": "model_catalog_json",
@@ -1186,6 +1600,7 @@ fn models_from_config_model_catalog_json(
         Err(error) => {
             return (
                 Vec::new(),
+                Map::new(),
                 Some(json!({
                     "id": "config:model_catalog_json",
                     "type": "model_catalog_json",
@@ -1200,9 +1615,24 @@ fn models_from_config_model_catalog_json(
         }
     };
     let models = unique_strings(parse_model_catalog_json_models(&payload));
+    let metadata = payload["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| catalog_model_visible_in_api(entry))
+        .filter_map(|entry| {
+            let slug = entry.get("slug")?.as_str()?.trim();
+            if slug.is_empty() {
+                return None;
+            }
+            crate::model_suffix::model_ui_metadata_with_override(slug, Some(entry))
+                .map(|fields| (slug.to_string(), fields))
+        })
+        .collect();
     let count = models.len();
     (
         models,
+        metadata,
         Some(json!({
             "id": "config:model_catalog_json",
             "type": "model_catalog_json",
@@ -1342,6 +1772,55 @@ mod model_fetch_tests {
         let catalog = relay_profile_model_catalog_value(home.path(), &profile);
 
         assert_eq!(catalog["default_model"], "qwen3-coder");
+    }
+
+    #[test]
+    fn effective_config_model_requires_valid_explicit_config_and_profile() {
+        for (config, expected) in [
+            ("", ""),
+            ("default_model = 'fallback'\n", ""),
+            ("model = ' root '\n", "root"),
+            (
+                "model = 'root'\nprofile = 'work'\n[profiles.work]\nmodel = 'profile'\n",
+                "profile",
+            ),
+            (
+                "model = 'root'\nprofile = 'work'\n[profiles.work]\nother = true\n",
+                "root",
+            ),
+            ("model = 'root'\nprofile = 'missing'\n", ""),
+            ("model = 'root'\nprofile = 5\n", ""),
+            (
+                "model = 'root'\nprofile = 'work'\n[profiles.work]\nmodel = 5\n",
+                "",
+            ),
+            ("model = 'root'\nmodel = 'duplicate'\n", ""),
+            ("model = [invalid\n", ""),
+        ] {
+            assert_eq!(effective_config_model(config), expected, "{config}");
+        }
+    }
+
+    #[test]
+    fn relay_profile_catalog_default_identity_comes_from_live_config() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = RelayProfile {
+            model: "candidate".into(),
+            model_list: "candidate\nother".into(),
+            config_contents: "model = 'snapshot'\n".into(),
+            ..RelayProfile::default()
+        };
+        let catalog = relay_profile_model_catalog_value(home.path(), &profile);
+        assert_eq!(catalog["default_model"], "candidate");
+        assert_eq!(catalog["effective_config_model"], "");
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model = 'root'\nprofile = 'work'\n[profiles.work]\nmodel = 'live'\n",
+        )
+        .unwrap();
+        let catalog = relay_profile_model_catalog_value(home.path(), &profile);
+        assert_eq!(catalog["effective_config_model"], "live");
+        assert!(!catalog["models"].as_array().unwrap().contains(&json!("live")));
     }
 
     #[test]
@@ -1665,5 +2144,83 @@ mod model_fetch_tests {
         );
         assert!(lower.contains("chatgpt-account-id: acct-1"), "{request}");
         assert!(lower.contains("originator: codex_cli_rs"), "{request}");
+    }
+}
+
+#[cfg(test)]
+mod price_overlay_tests {
+    use super::*;
+
+    const PRICES: &str = r#"{
+      "deepseek": { "id": "deepseek", "name": "DeepSeek", "api": "https://api.deepseek.com",
+        "models": { "deepseek-chat": { "id": "deepseek-chat", "cost": { "input": 0.27, "output": 1.1, "cache_read": 0.07 } } } },
+      "anthropic": { "id": "anthropic", "name": "Anthropic",
+        "models": { "claude-sonnet-4-5": { "id": "claude-sonnet-4-5", "cost": { "input": 3, "output": 15 } } } },
+      "zhipuai": { "id": "zhipuai", "name": "Zhipu AI", "api": "https://open.bigmodel.cn/api/paas/v4",
+        "models": { "glm-4.6": { "id": "glm-4.6", "cost": { "input": 0.6, "output": 2.2 } } } }
+    }"#;
+
+    fn prices() -> crate::model_pricing::PriceCatalog {
+        crate::model_pricing::PriceCatalog::parse(PRICES).unwrap()
+    }
+
+    fn settings() -> BackendSettings {
+        let mut settings = BackendSettings::default();
+        settings.relay_profiles = vec![
+            RelayProfile {
+                id: "deepseek".to_string(),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: "glm".to_string(),
+                base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
+                ..RelayProfile::default()
+            },
+        ];
+        settings
+    }
+
+    #[test]
+    fn aggregate_entries_lookup_with_member_base_url_and_bare_upstream() {
+        let settings = settings();
+        let mut catalog = json!({
+            "model_provider": "agg",
+            "modelMetadata": {
+                "cpx-deepseek/deepseek-chat": { "codex_plus_group_id": "deepseek" },
+                "cpx-glm/glm-4.6": { "codex_plus_group_id": "glm" },
+                "deepseek-chat": { "codex_plus_group_id": "deepseek" },
+                "cpx-glm/claude-sonnet-4-5": { "codex_plus_group_id": "glm" },
+                "unknown-model": { "codex_plus_group_id": "deepseek" },
+                "no-group": {}
+            }
+        });
+        let catalog_provider = catalog["model_provider"].as_str().unwrap().to_string();
+        let metadata = catalog["modelMetadata"].as_object_mut().unwrap();
+        overlay_prices(metadata, &prices(), |group_id| {
+            group_base_url(Some(&settings), &catalog_provider, group_id)
+        });
+        let entry = &catalog["modelMetadata"]["cpx-deepseek/deepseek-chat"]["codex_plus_price"];
+        assert_eq!((entry["input"].as_f64(), entry["output"].as_f64()), (Some(0.27), Some(1.1)));
+        assert_eq!(entry["provider"].as_str(), Some("DeepSeek"));
+        // 默认成员的裸名 slug 一样能查到，上游名不会被成员前缀卡住。
+        assert!(catalog["modelMetadata"]["deepseek-chat"]["codex_plus_price"].is_object());
+        // 成员前缀剥掉后按供应商地址查：glm 的 claude 走 zhipu 价目查不到就退回原厂提示价。
+        let resold = &catalog["modelMetadata"]["cpx-glm/claude-sonnet-4-5"]["codex_plus_price"];
+        assert_eq!(resold["provider"].as_str(), Some("Anthropic"));
+        assert!(catalog["modelMetadata"]["unknown-model"].get("codex_plus_price").is_none());
+        // 没有分组归属的条目按目录级 model_provider 找 profile，找不到就按名猜。
+        assert!(catalog["modelMetadata"]["no-group"].get("codex_plus_price").is_none());
+    }
+
+    #[test]
+    fn entry_upstream_strips_only_member_prefix() {
+        let group = "deepseek";
+        assert_eq!(
+            entry_upstream_model("cpx-deepseek/anthropic/claude-sonnet-4-5", group),
+            "anthropic/claude-sonnet-4-5"
+        );
+        assert_eq!(entry_upstream_model("deepseek-chat", group), "deepseek-chat");
+        assert_eq!(entry_upstream_model("cpx-other/x", ""), "cpx-other/x");
     }
 }

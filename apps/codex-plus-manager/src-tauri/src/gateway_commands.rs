@@ -4,7 +4,7 @@
 //! 直连模式的 Codex / Claude / Grok 供应商只在「导入」时被读取并复制一份。
 
 use anyhow::Context;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -51,6 +51,8 @@ pub struct GatewayPoolEntry {
     pub model_windows: std::collections::BTreeMap<String, u64>,
     /// 没单独写窗口的模型用的窗口。
     pub context_window: Option<u64>,
+    /// 自动压缩阈值（窗口的百分比，按模型 + 默认值，#3100）；没设时为空。
+    pub auto_compact: codex_plus_core::gateway::store::ProviderAutoCompact,
     /// 登录得到的账号：`chatgpt` / `copilot` / `grok`；普通供应商为空。
     pub account: String,
     /// 订阅账号的套餐（如「ChatGPT Pro」「Copilot Pro+」）；普通供应商为空。
@@ -75,6 +77,9 @@ pub struct GatewayPoolEntry {
     pub upstream_gone: Vec<String>,
     /// 订阅账号的额度（ChatGPT 5 小时 / 每周、Copilot 本月高级请求）；查不到或普通供应商为空。
     pub quota: Option<codex_plus_core::gateway::quota::ProviderQuota>,
+    pub subscription_policy:
+        Option<codex_plus_core::gateway::store::SubscriptionPolicy>,
+    pub subscription_block_reason: Option<String>,
     /// 有余额接口的厂商（DeepSeek、Kimi 等，#2793）：卡片用「用量」页同一份余额，不当中转站识别。
     pub balance_api: bool,
     /// new-api 访问令牌（打码，#2793）；没配置为空。令牌原文不传给界面。
@@ -97,6 +102,10 @@ pub struct GatewayAgentView {
     pub requires_disconnect_preview: bool,
     pub base_url: String,
     pub default_model: String,
+    /// 当前默认选择在实际路由快照中的状态。
+    pub default_selection_status: Option<&'static str>,
+    /// 网关默认模型的成员与可编辑供应商池不一致时，界面只显示模型 ID。
+    pub default_model_differs: bool,
     pub models: Vec<String>,
     /// 开着网关、但配置已被别的工具改掉（请求不再经过 Codex++）。
     pub drift: Option<codex_plus_core::gateway::drift::Drift>,
@@ -121,6 +130,29 @@ pub struct AutoGroupView {
 pub struct GatewaySourceEntry {
     pub id: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeAuthAccount {
+    pub id: String,
+    pub name: String,
+    pub email: String,
+    pub workspace_id: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeAuthState {
+    pub managed: bool,
+    pub selection: Option<codex_plus_core::settings::NativeAuthSelection>,
+    pub actual_account_ref: Option<String>,
+    pub actual_label: String,
+    pub accounts: Vec<NativeAuthAccount>,
+    pub drift: Option<String>,
+    /// 当前连接不能应用所选身份时，提示先处理连接而非反复重启。
+    pub restart_blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -218,6 +250,7 @@ fn pool_entry(
         model_prices,
         model_windows: Default::default(),
         context_window: None,
+        auto_compact: Default::default(),
         model_metadata: relay.model_metadata.clone(),
         image_models: codex_plus_core::gateway::images::provider_image_models(relay),
         account: account_kind(relay),
@@ -231,7 +264,9 @@ fn pool_entry(
         disable_tool_search: relay.disable_tool_search,
         upstream_new: upstream.0,
         upstream_gone: upstream.1,
-        quota: codex_plus_core::gateway::quota::get(&relay.id),
+        quota: codex_plus_core::gateway::quota::quota_for_relay(relay),
+        subscription_policy: None,
+        subscription_block_reason: None,
         balance_api: codex_plus_core::gateway::balance::has_balance_api(relay),
         newapi_access: None,
     }
@@ -252,16 +287,54 @@ fn account_kind(relay: &RelayProfile) -> String {
         .unwrap_or_default()
 }
 
+fn default_model_view(
+    gateway: &GatewaySettings,
+    runtime: &GatewaySettings,
+    binding: &AgentBinding,
+) -> (String, Option<&'static str>, bool) {
+    use codex_plus_core::gateway::route::model_entry_members;
+
+    let model = apply::resolved_default_model(runtime, binding);
+    let (selected, _) = codex_plus_core::model_suffix::parse_model_suffix(binding.model.trim());
+    let status = binding.selection_for(&selected).map(|_| {
+        if !model.eq_ignore_ascii_case(&selected) {
+            "fallback"
+        } else if model_entry_members(runtime, binding, &selected).is_empty() {
+            "invalid"
+        } else {
+            "available"
+        }
+    });
+    let differs = if !model.is_empty() {
+        let actual = model_entry_members(runtime, binding, &model);
+        let local = model_entry_members(gateway, binding, &model);
+        actual.len() != local.len() || actual.iter().zip(&local).any(|((actual, actual_model), (local, local_model))| {
+            actual.id != local.id
+                || actual.name != local.name
+                || actual_model != local_model
+                || runtime.provider(&actual.id).map(|provider| &provider.source)
+                    != gateway.provider(&local.id).map(|provider| &provider.source)
+        })
+    } else {
+        false
+    };
+    (model, status, differs)
+}
+
 fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> GatewayPayload {
     let port = port();
+    let runtime_gateway = gateway.clone().with_extension_providers();
     let pool = gateway
         .providers
         .iter()
         .map(|provider| GatewayPoolEntry {
             keys: apply::provider_keys(&provider.relay),
             newapi_access: apply::provider_newapi_access(provider),
+            subscription_policy: provider.subscription_policy.clone(),
+            subscription_block_reason: codex_plus_core::gateway::quota::dispatch_decision(&gateway, &provider.relay).err().map(|blocked| blocked.message),
             model_windows: provider.model_windows.clone(),
             context_window: provider.context_window,
+            auto_compact: provider.auto_compact.clone(),
             key_rpm: provider.key_rpm,
             key_concurrency: provider.key_concurrency,
             ..pool_entry(
@@ -306,6 +379,9 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         .map(|agent| {
             let binding = gateway.binding(agent);
             let enabled = binding.is_some_and(|binding| binding.enabled);
+            let (default_model, default_selection_status, default_model_differs) = binding
+                .map(|binding| default_model_view(&gateway, &runtime_gateway, binding))
+                .unwrap_or_default();
             GatewayAgentView {
                 agent: agent.as_str().to_string(),
                 name: codex_plus_core::tools::tool_display_name(agent).to_string(),
@@ -323,9 +399,9 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
                         _ => false,
                     },
                 base_url: apply::gateway_base_url(port, agent),
-                default_model: binding
-                    .map(|binding| apply::resolved_default_model(&gateway, binding))
-                    .unwrap_or_default(),
+                default_model,
+                default_selection_status,
+                default_model_differs,
                 models: codex_plus_core::gateway::server::exposed_models(&gateway, agent),
                 drift: binding
                     .filter(|binding| binding.enabled)
@@ -426,6 +502,189 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
     }
 }
 
+fn native_auth_state() -> anyhow::Result<NativeAuthState> {
+    let settings = SettingsStore::default().load()?;
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let live = match std::fs::read_to_string(home.join("auth.json")) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let gateway = GatewayStore::default().load()?;
+    let has_native_login = codex_plus_core::official_login::official_login_from_auth_contents(&live).is_some();
+    let mut accounts = Vec::new();
+    let mut actual_account_ref = None;
+    let mut actual_label = if has_native_login { "ChatGPT".to_string() } else { String::new() };
+    for provider in &gateway.providers {
+        if codex_plus_core::official_login::official_login_from_auth_contents(
+            &provider.relay.auth_contents,
+        )
+        .is_none()
+        {
+            continue;
+        }
+        let account_id = codex_plus_core::official_login::chatgpt_account_id_from_auth_contents(
+            &provider.relay.auth_contents,
+        );
+        let name = provider.relay.name.clone();
+        if !live.trim().is_empty()
+            && codex_plus_core::native_auth::same_account(&live, &provider.relay.auth_contents)
+            && (actual_account_ref.is_none()
+                || codex_plus_core::native_auth::selection_account_ref(&settings)
+                    == Some(provider.relay.id.as_str()))
+        {
+            actual_account_ref = Some(provider.relay.id.clone());
+            actual_label = name.clone();
+        }
+        accounts.push(NativeAuthAccount {
+            id: provider.relay.id.clone(),
+            name,
+            email: String::new(),
+            workspace_id: account_id,
+            source: provider.source.clone(),
+        });
+    }
+    let mut drift = match settings.native_auth_selection.as_ref() {
+        Some(codex_plus_core::settings::NativeAuthSelection::None) if has_native_login => {
+            Some("当前 auth 仍有登录凭据".to_string())
+        }
+        Some(codex_plus_core::settings::NativeAuthSelection::Account { account_ref })
+            if actual_account_ref.as_deref() != Some(account_ref.as_str()) =>
+        {
+            Some("当前 auth 与显式选择不一致".to_string())
+        }
+        _ => None,
+    };
+    let managed = settings.active_relay_id == apply::CODEX_GATEWAY_RELAY_ID;
+    let config = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+    let live_official = codex_plus_core::relay_config::relay_session_provider_from_config(&config)
+        == codex_plus_core::settings::RelaySessionProvider::Openai;
+    let blocked_reason = if let Some(selection) = settings.native_auth_selection.as_ref() {
+        let binding_enabled = gateway.binding(&ToolId::Codex).is_some_and(|binding| binding.enabled);
+        let taken_over = codex_plus_core::gateway::drift::check(&context(), &ToolId::Codex).is_some();
+        let wants_account = matches!(selection, codex_plus_core::settings::NativeAuthSelection::Account { .. });
+        native_auth_restart_blocker(managed, binding_enabled, taken_over,
+            wants_account && codex_plus_core::wsl_network::codex_runs_in_wsl(&home),
+            wants_account, live_official)
+    } else {
+        None
+    };
+    if drift.is_none() && blocked_reason.is_none()
+        && settings.active_relay_id == apply::CODEX_GATEWAY_RELAY_ID
+        && let Some(selection) = settings.native_auth_selection.as_ref()
+    {
+        let expected = matches!(selection, codex_plus_core::settings::NativeAuthSelection::Account { .. });
+        let saved_official = settings.active_relay_session_provider()
+            == codex_plus_core::settings::RelaySessionProvider::Openai;
+        if expected != live_official || expected != saved_official {
+            drift = Some("当前连接尚未切换到所选登录身份，请重新应用".to_string());
+        }
+    }
+    Ok(NativeAuthState {
+        managed: settings.native_auth_selection.is_some(),
+        selection: settings.native_auth_selection,
+        actual_account_ref,
+        actual_label,
+        accounts,
+        drift,
+        restart_blocked_reason: blocked_reason.map(str::to_string),
+    })
+}
+
+fn native_auth_restart_blocker(
+    managed: bool,
+    binding_enabled: bool,
+    taken_over: bool,
+    wsl_account: bool,
+    wants_account: bool,
+    live_official: bool,
+) -> Option<&'static str> {
+    if managed && !binding_enabled {
+        Some("Codex 网关连接未启用；登录选择已保存，接入后再应用")
+    } else if managed && taken_over {
+        Some("Codex 配置已由其他工具接管；请先恢复网关连接")
+    } else if wsl_account {
+        Some("WSL 连接不使用官方登录身份；当前选择无法在此连接生效")
+    } else if wants_account != live_official && !managed {
+        Some("当前直连配置不支持所选登录状态；请先调整连接身份")
+    } else {
+        None
+    }
+}
+
+#[tauri::command]
+pub fn get_native_auth_state() -> CommandResult<NativeAuthState> {
+    match native_auth_state() {
+        Ok(state) => ok("", state),
+        Err(error) => failed(&format!("读取原生登录状态失败：{error}"), NativeAuthState {
+            managed: false,
+            selection: None,
+            actual_account_ref: None,
+            actual_label: String::new(),
+            accounts: Vec::new(),
+            drift: Some(error.to_string()),
+            restart_blocked_reason: None,
+        }),
+    }
+}
+
+#[tauri::command]
+pub fn set_native_auth_account(account_ref: Option<String>) -> CommandResult<NativeAuthState> {
+    let result = (|| -> anyhow::Result<NativeAuthState> {
+        if let Some(account_ref) = account_ref.as_deref() {
+            let gateway = GatewayStore::default().load()?;
+            let provider = gateway
+                .provider(account_ref)
+                .context("所选 ChatGPT 账号不存在")?;
+            if codex_plus_core::official_login::official_login_from_auth_contents(
+                &provider.relay.auth_contents,
+            )
+            .is_none()
+            {
+                anyhow::bail!("所选供应商没有可用的 ChatGPT 登录凭据");
+            }
+        }
+        codex_plus_core::native_auth::set_native_auth_selection(account_ref.as_deref())?;
+        notify_settings_changed();
+        // 复用网关已有的官方会话身份转换，不能只写 auth 而继续留下 requires_openai_auth=false。
+        if apply::sync_codex_identity_after_selection(&context()).is_err() {
+            anyhow::bail!("登录选择已保存，但连接身份同步失败，请重新应用；尚未重启 Codex");
+        }
+        notify_settings_changed();
+        native_auth_state()
+    })();
+    match result {
+        Ok(state) => ok("原生登录选择已保存。", state),
+        Err(error) => failed(&format!("保存原生登录选择失败：{error}"),
+            native_auth_state().unwrap_or(NativeAuthState {
+                managed: false,
+                selection: None,
+                actual_account_ref: None,
+                actual_label: String::new(),
+                accounts: Vec::new(),
+                drift: Some(error.to_string()),
+                restart_blocked_reason: None,
+            })),
+    }
+}
+
+#[cfg(test)]
+mod native_auth_restart_tests {
+    use super::native_auth_restart_blocker;
+
+    #[test]
+    fn unavailable_connection_never_promises_that_a_restart_will_apply_the_login() {
+        assert!(native_auth_restart_blocker(true, false, false, false, true, false).is_some());
+        assert!(native_auth_restart_blocker(true, true, true, false, true, false).is_some());
+        assert!(native_auth_restart_blocker(true, true, false, true, true, false).is_some());
+        assert!(native_auth_restart_blocker(false, false, false, false, true, false).is_some());
+        assert!(native_auth_restart_blocker(false, false, false, false, false, true).is_some());
+        assert_eq!(native_auth_restart_blocker(false, false, false, false, true, true), None);
+        assert_eq!(native_auth_restart_blocker(false, false, false, false, false, false), None);
+        assert_eq!(native_auth_restart_blocker(true, true, false, false, true, true), None);
+    }
+}
+
 fn current_payload() -> Option<GatewayPayload> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     let gateway = GatewayStore::default().load().ok()?;
@@ -475,10 +734,17 @@ fn refresh_agents<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
     result
 }
 
+fn refresh_group_agents<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    let saved = result?;
+    apply::refresh_enabled(&context()).context("模型组设置已保存，但 Agent 配置刷新失败")?;
+    Ok(saved)
+}
+
 /// 界面每隔几秒轮询一次：读设置、gateway.json、检查各 Agent 配置漂移都是文件 IO，
 /// 放到阻塞线程池里做，不占主线程。返回格式不变。
 #[tauri::command]
 pub async fn load_gateway() -> CommandResult<Option<GatewayPayload>> {
+    refresh_quotas();
     match tauri::async_runtime::spawn_blocking(load_gateway_blocking).await {
         Ok(result) => result,
         Err(error) => failed(&format!("读取网关状态失败：{error}"), None),
@@ -667,12 +933,21 @@ pub fn disable_gateway_binding_full_switch(
 pub fn save_gateway_binding(
     agent: String,
     binding: AgentBinding,
+    reconnect: Option<bool>,
 ) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
         let agent = parse_agent(&agent)?;
-        let saved = apply::enable_binding(&context(), &agent, binding)?;
+        let ctx = context();
+        let (saved, changed) = if agent == ToolId::Codex {
+            apply::enable_binding_deferred(&ctx, &agent, binding)?
+        } else {
+            (apply::enable_binding(&ctx, &agent, binding)?, false)
+        };
         if sync_resident_helper().is_none() {
             anyhow::bail!("网关绑定已写入，但本地网关没能启动，请查看诊断日志");
+        }
+        if agent == ToolId::Codex && (changed || reconnect.unwrap_or(false)) {
+            codex_plus_core::gateway::connection_generation::publish(&ctx.codex_home)?;
         }
         Ok(saved)
     })();
@@ -743,21 +1018,24 @@ pub fn use_gateway_own_model(
 pub fn rotate_gateway_token(agent: String) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
         let agent = parse_agent(&agent)?;
-        let store = GatewayStore::default();
-        // 带锁读改写：只换这个 Agent 的 token，不拿旧状态覆盖同时刷新写回的登录 token。
-        let (gateway, binding) = store.update(|gateway| {
-            let Some(binding) = gateway.bindings.get_mut(agent.as_str()) else {
-                anyhow::bail!("还没有配置网关绑定");
-            };
-            binding.token = new_client_token(&agent);
-            Ok(binding.clone())
-        })?;
-        if binding.enabled {
-            return apply::enable_binding(&context(), &agent, binding);
+        let ctx = context();
+        let (saved, changed) = apply::rotate_binding_token(&ctx, &agent)?;
+        if agent == ToolId::Codex && changed {
+            if sync_resident_helper().is_none() {
+                anyhow::bail!("网关 token 已更换，但本地网关没能启动，请查看诊断日志");
+            }
+            codex_plus_core::gateway::connection_generation::publish(&ctx.codex_home)?;
         }
-        Ok(gateway)
+        Ok(saved)
     })();
     respond("已更换网关 token。", "更换网关 token 失败", result)
+}
+
+#[tauri::command]
+pub fn reset_gateway_model_selections(agent: String) -> CommandResult<Option<GatewayPayload>> {
+    let result = parse_agent(&agent)
+        .and_then(|agent| apply::reset_model_selections(&GatewayStore::default(), &agent));
+    respond("已清除历史模型选择。", "清除历史模型选择失败", refresh_agents(result))
 }
 
 /// 网关全局选项：Key 轮换方式、退出时恢复直连。
@@ -778,6 +1056,19 @@ pub fn save_gateway_options(
         Ok(gateway)
     })();
     respond("网关选项已保存。", "保存网关选项失败", result)
+}
+
+/// 「子智能体使用自己请求的模型」开关：开着时子智能体请求按 Codex 实际请求的模型发送，
+/// 不继承父回合的模型身份（#2987）。只影响之后的请求，不需要重写 Agent 配置。
+#[tauri::command]
+pub fn save_gateway_subagent_model_policy(
+    follow_request: bool,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = GatewayStore::default().update(|gateway| {
+        gateway.subagent_model_follow_request = follow_request;
+        Ok(())
+    });
+    respond("子智能体模型策略已保存。", "保存子智能体模型策略失败", result)
 }
 
 /// 「多家自动切换」开关：多家都有的模型额外列一份按顺序自动切换的入口。改完重写开着的 Agent 配置。
@@ -872,7 +1163,12 @@ pub fn save_gateway_image_model(
                     .insert(agent.as_str().to_string(), model.to_string());
             }
             Ok(())
-        })
+        })?;
+        if agent == ToolId::Codex {
+            apply::refresh_enabled(&context())
+                .context("生图模型已保存，但应用 Codex 配置失败")?;
+        }
+        Ok(())
     });
     respond("生图模型已保存。", "保存生图模型失败", result)
 }
@@ -946,18 +1242,43 @@ pub fn save_gateway_provider_metadata(
 }
 
 /// 自动组卡片上的设置（模式、会话固定、隐藏成员、手动选中的成员、隐藏整个自动组）。和默认一样时记录会被删掉。
+#[derive(Deserialize)]
+pub struct AutoGroupInput {
+    #[serde(flatten)]
+    settings: codex_plus_core::gateway::store::AutoGroupSettings,
+    #[serde(default)]
+    hidden: Option<bool>,
+}
+
 #[tauri::command]
 pub fn save_gateway_auto_group(
     model: String,
-    settings: codex_plus_core::gateway::store::AutoGroupSettings,
+    settings: AutoGroupInput,
 ) -> CommandResult<Option<GatewayPayload>> {
     respond(
         "自动组已保存。",
-        "保存自动组失败",
-        refresh_agents(apply::save_auto_group(
+        "自动组更新未完全完成",
+        refresh_group_agents(apply::save_auto_group_with_hidden(
             &GatewayStore::default(),
             &model,
-            settings,
+            settings.settings,
+            settings.hidden,
+        )),
+    )
+}
+
+#[tauri::command]
+pub fn set_gateway_auto_group_enabled(
+    model: String,
+    enabled: bool,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "自动组已保存。",
+        "自动组更新未完全完成",
+        refresh_group_agents(apply::set_auto_group_enabled(
+            &GatewayStore::default(),
+            &model,
+            enabled,
         )),
     )
 }
@@ -1016,6 +1337,7 @@ pub fn update_gateway_provider(
     // 表单里可能改了模型列表：新模型按公开价格表补价格。
     if result.is_ok() {
         autofill_prices(Some(id));
+        refresh_quotas();
     }
     respond("供应商已保存。", "保存供应商失败", result)
 }
@@ -1202,22 +1524,31 @@ pub fn save_gateway_provider_newapi_access(
     )
 }
 
-/// 改供应商的上下文窗口（按模型的和其余模型用的默认值）；窗口写在 Agent 的模型资料里，存完重写 Agent 配置。
+/// 改供应商的上下文窗口（按模型的和其余模型用的默认值）与自动压缩阈值（#3100，可不传）；
+/// 都写在 Agent 的模型资料里，存完重写 Agent 配置。
 #[tauri::command]
 pub fn save_gateway_provider_windows(
     id: String,
     windows: std::collections::BTreeMap<String, u64>,
     fallback: Option<u64>,
+    auto_compact: Option<codex_plus_core::gateway::store::ProviderAutoCompact>,
 ) -> CommandResult<Option<GatewayPayload>> {
+    let store = GatewayStore::default();
+    let result = apply::set_provider_windows(&store, &id, windows, fallback)
+        .and_then(|saved| match auto_compact {
+            // 旧界面不传压缩阈值：原样保留（#3100）。
+            Some(auto_compact) => apply::set_provider_auto_compact(&store, &id, auto_compact),
+            None => Ok(saved),
+        })
+        .and_then(|saved| {
+            apply::refresh_enabled(&context())
+                .context("窗口已保存，但刷新 Agent 配置失败")?;
+            Ok(saved)
+        });
     respond(
         "上下文窗口已保存。",
-        "保存上下文窗口失败",
-        refresh_agents(apply::set_provider_windows(
-            &GatewayStore::default(),
-            &id,
-            windows,
-            fallback,
-        )),
+        "更新上下文窗口失败",
+        result,
     )
 }
 
@@ -1308,11 +1639,12 @@ pub fn apply_gateway_provider_windows_sync(
     id: String,
     picks: Vec<meta_sync::WindowPick>,
 ) -> CommandResult<Option<GatewayPayload>> {
-    let result = refresh_agents(meta_sync::apply_window_sync(
-        &GatewayStore::default(),
-        &id,
-        &picks,
-    ));
+    let result = meta_sync::apply_window_sync(&GatewayStore::default(), &id, &picks)
+        .and_then(|saved| {
+            apply::refresh_enabled(&context())
+                .context("窗口已同步，但刷新 Agent 配置失败")?;
+            Ok(saved)
+        });
     let message = match &result {
         Ok((_, written)) => format!("已从上游同步 {written} 个模型的上下文窗口。"),
         Err(_) => String::new(),
@@ -1428,15 +1760,24 @@ fn autofill_prices(only: Option<String>) {
 /// 后台查一遍订阅账号的额度（刚登录的账号不用等下一轮）。
 fn refresh_quotas() {
     tauri::async_runtime::spawn(async move {
-        let Ok(gateway) = GatewayStore::default().load() else {
-            return;
-        };
-        for provider in gateway.providers.iter().filter(|provider| provider.enabled) {
-            if codex_plus_core::gateway::quota::supports(&provider.relay) {
-                let _ = codex_plus_core::gateway::quota::refresh(&provider.relay).await;
-            }
-        }
+        prefetch_quotas().await;
     });
+}
+
+async fn prefetch_quotas() {
+    if let Ok(gateway) = GatewayStore::default().load() {
+        codex_plus_core::gateway::quota::prefetch(&gateway).await;
+    }
+}
+
+async fn prefetch_changed_quotas(before: &GatewaySettings) {
+    if let Ok(mut gateway) = GatewayStore::default().load() {
+        gateway.providers.retain(|provider| before.provider(&provider.relay.id)
+            .is_none_or(|old| old.relay.auth_contents != provider.relay.auth_contents));
+        // 只等待此次导入/重登录的账号；其它账号留给后台，不拖住登录响应。
+        let _ = tokio::time::timeout(Duration::from_secs(8),
+            codex_plus_core::gateway::quota::prefetch(&gateway)).await;
+    }
 }
 
 /// 手动刷新一个账号的额度。
@@ -1508,6 +1849,12 @@ pub fn set_gateway_provider_enabled(
     id: String,
     enabled: bool,
 ) -> CommandResult<Option<GatewayPayload>> {
+    let result = refresh_agents(apply::set_provider_enabled(
+        &GatewayStore::default(), &id, enabled,
+    ));
+    if enabled && result.is_ok() {
+        refresh_quotas();
+    }
     respond(
         if enabled {
             "已打开，接入的 Agent 能用它的模型了。"
@@ -1515,11 +1862,7 @@ pub fn set_gateway_provider_enabled(
             "已关闭，它不再参与调度。"
         },
         "切换供应商失败",
-        refresh_agents(apply::set_provider_enabled(
-            &GatewayStore::default(),
-            &id,
-            enabled,
-        )),
+        result,
     )
 }
 
@@ -1557,6 +1900,7 @@ async fn import_opencode(id: &str, skip_agents: Option<&[String]>) -> anyhow::Re
         model_prices: None,
         proxy: None,
         strip_image_generation_tool: None,
+        subscription_policy: None,
         strip_responses_image_detail: None,
         disable_tool_search: None,
     };
@@ -1590,6 +1934,7 @@ pub async fn import_gateway_providers(
     items: Vec<ImportItem>,
     skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
+    let before = GatewayStore::default().load().unwrap_or_default();
     let skip = skip_agents.as_deref();
     let mut added = 0usize;
     let mut skipped = 0usize;
@@ -1637,6 +1982,7 @@ pub async fn import_gateway_providers(
         }
     }
     let _ = refresh_added(Ok(()));
+    prefetch_changed_quotas(&before).await;
     let mut message = format!("已导入 {added} 个供应商");
     if !groups.is_empty() {
         message.push_str(&format!("，建好模型组「{}」", groups.join("」「")));
@@ -1684,8 +2030,21 @@ fn import_from_direct(source: &str, id: &str, skip: Option<&[String]>) -> anyhow
 pub fn save_gateway_group(group: GroupInput) -> CommandResult<Option<GatewayPayload>> {
     respond(
         "模型组已保存。",
-        "保存模型组失败",
-        refresh_agents(apply::save_group(&GatewayStore::default(), &group)),
+        "模型组更新未完全完成",
+        refresh_group_agents(apply::save_group(&GatewayStore::default(), &group)),
+    )
+}
+
+#[tauri::command]
+pub fn set_gateway_group_enabled(id: String, enabled: bool) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "模型组已保存。",
+        "模型组更新未完全完成",
+        refresh_group_agents(apply::set_group_enabled(
+            &GatewayStore::default(),
+            &id,
+            enabled,
+        )),
     )
 }
 
@@ -1717,9 +2076,11 @@ pub fn reveal_gateway_agent_config(agent: String) -> CommandResult<Option<Gatewa
             .arg("-R")
             .arg(&path)
             .status()?;
+        // 展开的路径可能含正斜杠，资源管理器需要 Windows 分隔符。
         #[cfg(target_os = "windows")]
         let status = std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
+            .arg("/select,")
+            .arg(path.components().collect::<std::path::PathBuf>())
             .status()?;
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let status = std::process::Command::new("xdg-open")
@@ -1737,8 +2098,10 @@ fn agent_config_path(agent: &ToolId) -> String {
         ToolId::Codex => codex_plus_core::gateway::agents::AgentEnv::current().display(
             &codex_plus_core::relay_config::default_codex_home_dir().join("config.toml"),
         ),
-        ToolId::Claude => "~/.claude/settings.json".to_string(),
-        ToolId::Grok => "~/.grok/config.toml".to_string(),
+        ToolId::Claude => codex_plus_core::gateway::agents::AgentEnv::current()
+            .display(&codex_plus_core::tools::default_claude_home_dir().join("settings.json")),
+        ToolId::Grok => codex_plus_core::gateway::agents::AgentEnv::current()
+            .display(&codex_plus_core::grok_config::default_grok_home_dir().join("config.toml")),
         other => match codex_plus_core::gateway::agents::spec(other.as_str()) {
             Some(spec) => {
                 let env = codex_plus_core::gateway::agents::AgentEnv::current();
@@ -1854,6 +2217,166 @@ fn parse_version(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::parse_version;
+
+    #[test]
+    fn default_model_view_uses_the_extension_routing_snapshot() {
+        use codex_plus_core::gateway::store::{AgentBinding, GatewaySettings};
+        use codex_plus_core::user_scripts::UserScriptManager;
+        use serde_json::json;
+
+        let gateway: GatewaySettings = serde_json::from_value(json!({
+            "providers": [{
+                "source": "preset:a",
+                "relay": { "id": "a", "name": "A", "model": "m", "modelList": "m" }
+            }]
+        })).unwrap();
+        let binding: AgentBinding = serde_json::from_value(json!({
+            "model": "a/m[1M]",
+            "defaultModelSelection": { "providerId": "a", "upstreamModel": "m", "providerSource": "preset:a" }
+        })).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("user/swap");
+        std::fs::create_dir_all(&package).unwrap();
+        let manifest = package.join("codexpp.json");
+        let manager = UserScriptManager::new(
+            temp.path().join("builtin"),
+            temp.path().join("user"),
+            temp.path().join("user_scripts.json"),
+        );
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "a", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["m"], "override": false }]
+        }).to_string()).unwrap();
+        let unchanged = gateway.clone().with_extension_providers_from(&manager);
+        assert_eq!(super::default_model_view(&gateway, &unchanged, &binding), ("a/m".into(), Some("available"), false));
+
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "a", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["m"], "override": true }]
+        }).to_string()).unwrap();
+        let mut disabled = gateway.clone();
+        disabled.providers[0].enabled = false;
+        assert_eq!(super::default_model_view(&disabled, &disabled, &binding), ("".into(), Some("fallback"), false));
+        let overridden = disabled.clone().with_extension_providers_from(&manager);
+        assert_eq!(overridden.provider("a").unwrap().source, "extension:swap");
+        assert_eq!(super::default_model_view(&disabled, &overridden, &binding), ("m".into(), Some("fallback"), true));
+
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "b", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["a/m"] }]
+        }).to_string()).unwrap();
+        let collision = gateway.clone().with_extension_providers_from(&manager);
+        assert_eq!(super::default_model_view(&gateway, &collision, &binding), ("m".into(), Some("fallback"), false));
+
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "b", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["fallback"] }]
+        }).to_string()).unwrap();
+        let added = disabled.clone().with_extension_providers_from(&manager);
+        assert_eq!(super::default_model_view(&disabled, &added, &binding), ("fallback".into(), Some("fallback"), true));
+
+        let empty: AgentBinding = serde_json::from_value(json!({ "model": "" })).unwrap();
+        assert_eq!(super::default_model_view(&disabled, &added, &empty), ("fallback".into(), None, true));
+        assert_eq!(super::default_model_view(&disabled, &disabled, &empty), ("".into(), None, false));
+
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "a", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["m2"], "override": true }]
+        }).to_string()).unwrap();
+        let different_model = gateway.clone().with_extension_providers_from(&manager);
+        assert_eq!(super::default_model_view(&gateway, &different_model, &empty), ("m2".into(), None, true));
+
+        std::fs::write(&manifest, json!({
+            "id": "swap", "name": "swap",
+            "providers": [{ "id": "a", "baseUrl": "http://127.0.0.1:9000/v1", "models": ["m"], "override": true }]
+        }).to_string()).unwrap();
+        let mut with_group = gateway.clone();
+        with_group.groups = serde_json::from_value(json!([{
+            "id": "disabled", "name": "Disabled", "disabled": true, "members": []
+        }])).unwrap();
+        let inactive: AgentBinding = serde_json::from_value(json!({ "model": "group/disabled" })).unwrap();
+        let overridden = with_group.clone().with_extension_providers_from(&manager);
+        assert_eq!(super::default_model_view(&with_group, &overridden, &inactive), ("m".into(), None, true));
+        assert_eq!(super::default_model_view(&with_group, &with_group, &inactive), ("m".into(), None, false));
+    }
+
+    #[test]
+    fn agent_config_paths_follow_the_write_directories() {
+        use codex_plus_core::gateway::agents::AgentEnv;
+        use codex_plus_core::tools::ToolId;
+
+        const CHILD: &str = "CODEX_PLUS_TEST_AGENT_CONFIG_PATHS";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let env = AgentEnv::current();
+            let claude = env.expand(&super::agent_config_path(&ToolId::Claude));
+            let grok = env.expand(&super::agent_config_path(&ToolId::Grok));
+            assert!(
+                claude == codex_plus_core::tools::default_claude_home_dir().join("settings.json")
+            );
+            assert!(
+                grok == codex_plus_core::grok_config::default_grok_home_dir().join("config.toml")
+            );
+            if mode == "custom" {
+                assert!(
+                    claude
+                        == std::path::PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap())
+                            .join("settings.json")
+                );
+                assert!(
+                    grok == std::path::PathBuf::from(std::env::var_os("GROK_HOME").unwrap())
+                        .join("config.toml")
+                );
+            }
+            println!("agent config paths checked");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        for mode in ["default", "custom"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "gateway_commands::tests::agent_config_paths_follow_the_write_directories",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .env_remove("GROK_HOME");
+            if mode == "custom" {
+                child
+                    .env("CLAUDE_CONFIG_DIR", temp.path().join("claude config"))
+                    .env("GROK_HOME", temp.path().join("grok config"));
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success());
+            assert!(String::from_utf8_lossy(&output.stdout).contains("agent config paths checked"));
+        }
+    }
+
+    #[test]
+    fn auto_group_input_separates_optional_hidden_from_other_settings() {
+        use codex_plus_core::gateway::store::GroupMode;
+        use serde_json::json;
+
+        let input: super::AutoGroupInput = serde_json::from_value(json!({
+            "mode": "manual",
+            "hidden": true,
+            "hideMembers": true,
+            "pick": "provider/model",
+            "futureField": 3
+        }))
+        .unwrap();
+        assert_eq!(input.hidden, Some(true));
+        assert_eq!(input.settings.mode, GroupMode::Manual);
+        assert!(input.settings.hide_members);
+        assert_eq!(input.settings.pick, "provider/model");
+        assert_eq!(input.settings.extra["futureField"], 3);
+        assert!(!input.settings.extra.contains_key("hidden"));
+
+        let input: super::AutoGroupInput = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(input.hidden, None);
+    }
 
     #[test]
     fn cli_version_is_the_first_dotted_number() {
@@ -2113,6 +2636,14 @@ pub fn resume_agent_session(
 /// 最近一次打开的登录页地址：登录提示条上「复制登录链接」读它，方便用无痕窗口或别的浏览器打开（#2823）。
 static LAST_LOGIN_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// 清掉记住的登录地址：每次开始新登录时调用，避免提示条复制到上一次登录的旧链接。
+/// finish 阶段不能清——订阅 / Copilot 的登录网址是 start 阶段打开的，等待期间还要能复制。
+fn clear_login_url() {
+    if let Ok(mut slot) = LAST_LOGIN_URL.lock() {
+        *slot = None;
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginUrlPayload {
@@ -2206,7 +2737,7 @@ where
 }
 
 /// 登录命令统一的返回：成功刷新价格 / 额度 / Agent，取消时返回 `cancelled`。
-fn login_response(outcome: LoginOutcome<String>) -> CommandResult<Option<GatewayPayload>> {
+async fn login_response(outcome: LoginOutcome<String>, before: &GatewaySettings) -> CommandResult<Option<GatewayPayload>> {
     match outcome {
         LoginOutcome::Cancelled => CommandResult {
             status: "cancelled".to_string(),
@@ -2214,7 +2745,10 @@ fn login_response(outcome: LoginOutcome<String>) -> CommandResult<Option<Gateway
             payload: current_payload(),
         },
         LoginOutcome::Done(result) => match refresh_added(result) {
-            Ok(message) => ok(&message, current_payload()),
+            Ok(message) => {
+                prefetch_changed_quotas(before).await;
+                ok(&message, current_payload())
+            },
             Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
         },
     }
@@ -2239,7 +2773,10 @@ pub fn cancel_gateway_login() -> CommandResult<()> {
 
 #[cfg(test)]
 mod login_tests {
-    use super::{LoginOutcome, cancel_gateway_login, cancellable_login, login_slot};
+    use super::{
+        LAST_LOGIN_URL, LoginOutcome, cancel_gateway_login, cancellable_login, clear_login_url,
+        login_slot,
+    };
 
     /// 等后台登录任务登记好中止函数。
     fn wait_registered() {
@@ -2275,6 +2812,15 @@ mod login_tests {
             assert!(login_slot().is_none());
         });
     }
+
+    #[test]
+    fn clear_login_url_drops_the_remembered_address() {
+        if let Ok(mut slot) = LAST_LOGIN_URL.lock() {
+            *slot = Some("https://example.test/login".to_string());
+        }
+        clear_login_url();
+        assert!(LAST_LOGIN_URL.lock().unwrap().is_none());
+    }
 }
 
 /// 在网关里登录 ChatGPT 订阅：浏览器登录后加进网关的供应商池。同一个账号再登录只更新 token。
@@ -2283,7 +2829,9 @@ mod login_tests {
 pub async fn login_gateway_chatgpt(
     skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
+    let before = GatewayStore::default().load().unwrap_or_default();
     use codex_plus_core::gateway::accounts;
+    clear_login_url();
     let outcome = cancellable_login(async move {
         let account = accounts::chatgpt_login(open_in_browser).await?;
         let store = GatewayStore::default();
@@ -2294,7 +2842,9 @@ pub async fn login_gateway_chatgpt(
                 .providers
                 .iter_mut()
                 .find(|provider| {
-                    accounts::same_chatgpt_login(
+                    provider.source != "native:external"
+                    && !codex_plus_core::official_login::is_native_owned_login(&provider.relay)
+                    && accounts::same_chatgpt_login(
                         &provider.relay.auth_contents,
                         &account.auth_contents,
                     )
@@ -2322,7 +2872,7 @@ pub async fn login_gateway_chatgpt(
         })
     })
     .await;
-    login_response(outcome)
+    login_response(outcome, &before).await
 }
 
 /// 账号类供应商（Copilot / SuperGrok）加进网关池；同一个账号（按 `identity_field`）已存在时只换凭据。
@@ -2383,6 +2933,7 @@ fn add_account_provider(
 #[tauri::command]
 pub async fn start_gateway_copilot_login()
 -> CommandResult<Option<codex_plus_core::gateway::accounts::DeviceCode>> {
+    clear_login_url();
     match codex_plus_core::gateway::accounts::copilot_device_code().await {
         Ok(code) => {
             open_in_browser(&code.verification_uri);
@@ -2398,12 +2949,13 @@ pub async fn finish_gateway_copilot_login(
     code: codex_plus_core::gateway::accounts::DeviceCode,
     skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
+    let before = GatewayStore::default().load().unwrap_or_default();
     let outcome = cancellable_login(async move {
         let relay = codex_plus_core::gateway::accounts::copilot_finish(&code).await?;
         add_account_provider(relay, "copilot", "login", skip_agents.as_deref())
     })
     .await;
-    login_response(outcome)
+    login_response(outcome, &before).await
 }
 
 /// 在网关里登录 SuperGrok：浏览器登录后加进网关池。与 Grok CLI 自己的登录互不影响。
@@ -2411,7 +2963,9 @@ pub async fn finish_gateway_copilot_login(
 pub async fn login_gateway_grok(
     skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
+    let before = GatewayStore::default().load().unwrap_or_default();
     use codex_plus_core::gateway::accounts;
+    clear_login_url();
     let outcome = cancellable_login(async move {
         let tokens = accounts::grok_login(open_in_browser).await?;
         // 登录时还没有供应商（也就没有它的代理设置），走系统代理。
@@ -2424,7 +2978,7 @@ pub async fn login_gateway_grok(
         )
     })
     .await;
-    login_response(outcome)
+    login_response(outcome, &before).await
 }
 
 /// 在网关里登录 ChatGPT API（OpenAI 的「用 ChatGPT 登录」）：套餐额度直接用在 api.openai.com 上，
@@ -2433,7 +2987,9 @@ pub async fn login_gateway_grok(
 pub async fn login_gateway_chatgpt_api(
     skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
+    let before = GatewayStore::default().load().unwrap_or_default();
     use codex_plus_core::gateway::accounts;
+    clear_login_url();
     let outcome = cancellable_login(async move {
         let state_dir = codex_plus_core::paths::default_app_state_dir();
         let account = accounts::chatgpt_api_login(&state_dir, open_in_browser).await?;
@@ -2451,7 +3007,7 @@ pub async fn login_gateway_chatgpt_api(
         )
     })
     .await;
-    login_response(outcome)
+    login_response(outcome, &before).await
 }
 
 /// 私有接口订阅（Cursor、Kiro 等）登录第一步：按选的方式开始登录。要打开的网址在这里打开，
@@ -2474,6 +3030,9 @@ pub async fn start_gateway_subscription_login(
             SubscriptionLoginStartPayload { start: None },
         );
     };
+    // 导入本地凭据 / 粘贴凭据这类方式没有要打开的网址：先清掉上一次登录记住的地址，
+    // 否则等待条上的「复制登录链接」会拿到旧链接。
+    clear_login_url();
     let result = async {
         let http = codex_plus_core::http_client::proxied_client("")?;
         item.begin_login(&http, method, input.as_deref().unwrap_or_default())
@@ -2507,6 +3066,7 @@ pub async fn finish_gateway_subscription_login(
     start: codex_plus_core::gateway::subscriptions::LoginStart,
     skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
+    let before = GatewayStore::default().load().unwrap_or_default();
     use codex_plus_core::gateway::subscriptions;
     let outcome = cancellable_login(async move {
         let item = subscriptions::get(&kind)
@@ -2525,7 +3085,7 @@ pub async fn finish_gateway_subscription_login(
         )
     })
     .await;
-    login_response(outcome)
+    login_response(outcome, &before).await
 }
 
 /// 清掉某个供应商的 Key 冷却与熔断状态。
@@ -2697,4 +3257,73 @@ mod disconnect_preview_tests {
         assert_eq!(value["preview"], serde_json::Value::Null);
         assert!(value.get("preview").is_some());
     }
+}
+
+/// Codex 页面「供应商」页的网关命令分发（core `provider_page::route_gateway` 已做白名单与脱敏）。
+///
+/// 参数名与前端 `invoke` 一致（camelCase）。直接调用上面的命令函数，所以生效（`refresh_agents`）、
+/// 价格填充、额度预取、断开预览 token、`notify_settings_changed` 都与管理器自己的界面完全相同。
+/// 调用方在阻塞线程里（bridge 路由用 `spawn_blocking`），异步命令用 `block_on` 等结果。
+pub fn provider_page_gateway_call(command: &str, args: serde_json::Value) -> serde_json::Value {
+    fn arg<T: serde::de::DeserializeOwned>(args: &serde_json::Value, key: &str) -> Result<T, String> {
+        serde_json::from_value(args.get(key).cloned().unwrap_or(serde_json::Value::Null))
+            .map_err(|error| format!("参数 {key} 不正确：{error}"))
+    }
+    fn to_value<T: Serialize>(result: CommandResult<T>) -> serde_json::Value {
+        serde_json::to_value(result).unwrap_or_else(|error| {
+            serde_json::json!({ "status": "failed", "message": format!("返回结果无法序列化：{error}") })
+        })
+    }
+    let run = || -> Result<serde_json::Value, String> {
+        Ok(match command {
+            "load_gateway" => to_value(tauri::async_runtime::block_on(load_gateway())),
+            "create_gateway_provider" => to_value(create_gateway_provider(
+                arg(&args, "input")?,
+                arg::<Option<String>>(&args, "source")?.unwrap_or_else(|| "custom".to_string()),
+                arg(&args, "skipAgents")?,
+            )),
+            "update_gateway_provider" => to_value(update_gateway_provider(arg(&args, "id")?, arg(&args, "input")?)),
+            "delete_gateway_provider" => to_value(delete_gateway_provider(arg(&args, "id")?)),
+            "set_gateway_provider_enabled" => {
+                to_value(set_gateway_provider_enabled(arg(&args, "id")?, arg(&args, "enabled")?))
+            }
+            "reorder_gateway_providers" => to_value(reorder_gateway_providers(arg(&args, "ids")?)),
+            "add_gateway_provider_key" => to_value(add_gateway_provider_key(arg(&args, "id")?, arg(&args, "key")?)),
+            "replace_gateway_provider_key" => to_value(replace_gateway_provider_key(
+                arg(&args, "id")?,
+                arg(&args, "keyId")?,
+                arg(&args, "key")?,
+            )),
+            "delete_gateway_provider_key" => {
+                to_value(delete_gateway_provider_key(arg(&args, "id")?, arg(&args, "keyId")?))
+            }
+            "test_gateway_provider" => to_value(tauri::async_runtime::block_on(test_gateway_provider(
+                arg(&args, "id")?,
+                arg(&args, "model")?,
+                arg(&args, "keyId")?,
+            ))),
+            "cancel_gateway_provider_test" => to_value(cancel_gateway_provider_test()),
+            "fetch_provider_models" => to_value(tauri::async_runtime::block_on(crate::provider_lookup_commands::fetch_provider_models(
+                arg(&args, "baseUrl")?,
+                arg(&args, "protocol")?,
+                arg::<Option<String>>(&args, "apiKey")?.unwrap_or_default(),
+                arg(&args, "providerId")?,
+            ))),
+            "save_gateway_binding" => to_value(save_gateway_binding(
+                arg(&args, "agent")?,
+                arg(&args, "binding")?,
+                arg(&args, "reconnect")?,
+            )),
+            "preview_gateway_disconnect" => to_value(tauri::async_runtime::block_on(preview_gateway_disconnect(arg(&args, "agent")?))),
+            "disable_gateway_binding" => {
+                to_value(disable_gateway_binding(arg(&args, "agent")?, arg(&args, "previewToken")?))
+            }
+            "disable_gateway_binding_full_switch" => to_value(disable_gateway_binding_full_switch(
+                arg(&args, "agent")?,
+                arg(&args, "previewToken")?,
+            )),
+            other => return Err(format!("不支持的网关命令 {other}")),
+        })
+    };
+    run().unwrap_or_else(|message| serde_json::json!({ "status": "failed", "message": message }))
 }

@@ -54,11 +54,17 @@ test("Agent 一行一个始终可见（与设计图一致）；点开 Agent 后�
   assert.match(sidebar, /tone: "direct"/);
   const access = sidebar.slice(sidebar.indexOf("const access ="), sidebar.indexOf("return (", sidebar.indexOf("const access =")));
   assert.doesNotMatch(access, /running/);
-  // 只有 Codex 行有播放 / 停止：命令行 Agent 没有常驻进程可启停。
+  // 只有 Codex 和 Claude 行有播放 / 停止：其它命令行 Agent 没有常驻进程可启停。
   assert.match(sidebar, /\{tool\.id === "codex" && tool\.switchable \? \(\(\) => \{/);
   assert.match(sidebar, /const label = unattached \? t\("重启并挂载"\) : codexRun\.running \? t\("停止 Codex"\) : t\("启动 Codex"\);/);
   assert.match(sidebar, /aria-label=\{label\}/);
   assert.match(sidebar, /onClick=\{unattached \? codexRun\.onRestart : codexRun\.running \? codexRun\.onStop : codexRun\.onStart\}/);
+  // Claude 行同样有播放 / 停止（Claude Desktop 本地模式），视觉与 Codex 行一致。
+  assert.match(sidebar, /\{tool\.id === "claude" \? \(\(\) => \{/);
+  assert.match(sidebar, /const label = claudeRun\.running \? t\("停止本地服务"\) : t\("启动 Claude"\);/);
+  assert.match(sidebar, /onClick=\{claudeRun\.running \? claudeRun\.onStop : claudeRun\.onStart\}/);
+  assert.match(sidebar, /title=\{claudeRun\.busy \? t\("处理中…"\) : claudeRun\.running \? t\("停止本地服务"\) : claudeRun\.unavailableReason \?\? t\("启动 Claude"\)\}/);
+  assert.match(sidebar, /className="cx-side-run"\n\s*data-running=\{claudeRun\.running\}/);
   // 主动停止写 user_stopped，崩溃检测不把它当成意外停止。
   assert.match(text, /const stoppedByUser = result\.latest_launch\?\.phase === "user_stopped";/);
   const lib = readSource("../src-tauri/src/lib.rs");
@@ -124,7 +130,10 @@ test("启动 Codex 一眼可见：Codex 页面顶栏最右侧一个主按钮，�
   const sidebar = functionSource("AppSidebar");
   assert.match(sidebar, /tool\.id === "codex" && tool\.switchable \? "has-run" : ""/);
   assert.match(sidebar, /disabled=\{codexRun\.busy \|\| \(!codexRun\.running && Boolean\(codexRun\.unavailableReason\)\)\}/);
-  assert.match(entry, /codexRun=\{\{ running: codexAppRunning, busy: launchPending, unavailableReason: codexLaunch\.unavailableReason, onStart: codexLaunch\.onLaunch,/);
+  // 侧栏与「Agent 接入」里的 Codex 行共用同一份运行时对象，不再各写一份。
+  assert.match(entry, /const codexRun = \{\n\s*running: codexAppRunning,\n\s*unattached: Boolean\(overview\?\.runtime_health\?\.codex_unattached\),\n\s*busy: launchPending,\n\s*unavailableReason: codexLaunch\.unavailableReason,\n\s*onStart: codexLaunch\.onLaunch,/);
+  assert.match(entry, /codexRun=\{codexRun\}/);
+  assert.match(entry, /<GatewayPage[\s\S]*?codexRun=\{codexRun\}/);
   assert.match(styles, /\.shell \.side-agent-run \{\n(?:  [^\n]*\n)*  width: 24px;\n  height: 24px;/);
   assert.match(styles, /\.shell \.side-agent-run\[data-running="false"\] \{\n  background: hsl\(var\(--status-success\) \/ 0\.14\);\n  color: hsl\(var\(--status-success\)\);/);
   assert.doesNotMatch(styles, /:hover \.side-agent-run|\.side-agent-run \{[^}]*(?:opacity: 0;|visibility: hidden)/);
@@ -216,7 +225,7 @@ test("请求日志按 Agent 筛选；网关记录带 agent 字段，没有的算
   // 只管理 Codex 时固定看 Codex 的请求，不出现 Agent 筛选。
   assert.match(screen, /const agentScope = codexOnly \? "codex" : agentFilter;/);
   assert.match(screen, /agentScope !== "all" && requestLogAgent\(entry\) !== agentScope/);
-  assert.match(screen, /\[entries, filter, query, sessionFilter, agentScope\]/);
+  assert.match(screen, /\[entries, filter, query, sessionFilter, agentScope, payload\]/);
   assert.match(functionSource("requestLogAgent"), /return entry\.agent \|\| "codex";/);
 });
 
@@ -265,7 +274,7 @@ test("Skills 与 MCP 同一种行：每个 Skill 一行，右侧每个 Agent 一
   assert.match(extra, /<CxRow className="cx-skill-row"/);
   assert.match(extra, /const agentColumns: McpAgentId\[\] = MCP_AGENTS\.filter\(\(agent\) => agentVisible\(focus, agent\)\);/);
   // 行里每个可见 Agent 一枚开关；分组标题同一列是这一组的批量开关。
-  assert.match(extra, /agentColumns\.map\(\(agent\) => <AgentToggle /);
+  assert.match(extra, /agentColumns\.map\(\(agent\) => \{[\s\S]*?return <AgentToggle /);
   assert.match(extra, /agentColumns\.map\(\(agent\) => <GroupAgentSelect /);
   assert.doesNotMatch(extra, /mg-agent-toggle|mg-skill-group-select/);
   assert.doesNotMatch(css, /\.dark \.mg-skills-page|\.mg-skills-page \.mg-primary|\.mg-skills-page :is\(\.mg-button/);
@@ -300,7 +309,7 @@ test("安装维护并进 Codex 设置：在设置模式的「Codex」分类里�
   assert.match(maintenance, /actions\.clearCodexAppPath\(\)/);
 });
 
-test("页内目录收成单列：增强页的页签横排成胶囊、分组锚点不再显示；设置模式内容限宽", () => {
+test("页内目录收成单列：分组锚点不再显示；增强页不再分页签；设置模式内容限宽", () => {
   for (const page of ["settings-page enhance-page sectioned-page cx-enhance-page", "settings-page codex-settings-page", "weixin-connect-page sectioned-page cx-page"]) {
     assert.ok(text.includes(`className="${page}"`), page);
   }
@@ -308,7 +317,8 @@ test("页内目录收成单列：增强页的页签横排成胶囊、分组锚�
   assert.match(layer, /:root \.shell \.sectioned-page \{\n  display: flex;\n  flex-direction: column;/);
   assert.match(layer, /:root \.shell \.page-section-nav-list \{\n  display: none;/);
   assert.match(layer, /:root \.shell \.screen\[data-settings-mode="true"\] > \* \{\n  width: min\(100%, var\(--cx-content-narrow\)\);/);
-  assert.match(text, /className="enhance-tabs tp-tabs cx-pills" role="tablist"/);
+  // 增强页只剩总开关和独立模式，内置拓展的页签随设置一起搬进 Codex。
+  assert.doesNotMatch(text, /className="enhance-tabs/);
   // 「（实验）」和「需重启」从文字里拿出来做成标题旁的小标签。
   const toggle = functionSource("FeatureToggle");
   assert.match(toggle, /EXPERIMENTAL_TITLE\.test\(title\)/);
@@ -392,7 +402,7 @@ test("Codex 在「经网关」和「直连」之间一键切换：切到网关�
   const app = functionSource("App");
   // 切到网关：和「Agent 接入」开关同一条命令，沿用上次的绑定；池空或模型不在池里时说明原因并带去对应页面。
   assert.match(app, /const draft = draftFromBinding\(previous\);\n\s*const issue = validateDraft\(draft, payload\);/);
-  assert.match(app, /invoke<GatewayResult>\("save_gateway_binding", \{ agent: "codex", binding: \{ \.\.\.bindingFromDraft\(draft, previous\), enabled: true \} \}\)/);
+  assert.match(app, /invoke<GatewayResult>\("save_gateway_binding", \{ agent: "codex", binding: \{ \.\.\.bindingFromDraft\(draft, previous\), enabled: true \}, reconnect: true \}\)/);
   assert.match(app, /onConnect=\{\(\) => void connectCodexGateway\(\)\}/);
   const hint = functionSource("LegacyRelayGatewayHint");
   // 两段式切换在「连接方式」标题右侧；切回直连走 onDisconnect（断开并还原的预览对话框）。
@@ -515,14 +525,16 @@ test("「关于」并进「设置」：侧栏底部只留齿轮，设置模式�
   assert.match(app, /settingsSections\.map\(\(id\) => `:not\(#\$\{id\}\)`\)/);
   assert.match(app, /if \(settingsFocus\) setSettingsSections\(settingsSectionsFor\(settingsFocus\)\);/);
   const entries = text.slice(text.indexOf("function settingsNavEntries"), text.indexOf("const settingsModeRoutes"));
-  for (const id of ["app-settings-general", "app-settings-config", "app-settings-update", "app-settings-logs", "app-settings-diagnostics", "app-settings-about"]) {
+  for (const id of ["app-settings-general", "app-settings-config", "app-settings-doctor", "app-settings-update", "app-settings-logs", "app-settings-diagnostics", "app-settings-about"]) {
     assert.ok(entries.includes(`"${id}"`), `${id} 要归到某个设置分类`);
   }
   assert.match(app, /if \(target === "about"\) setSettingsFocus\("app-settings-update"\);/);
   assert.ok(app.indexOf("<GlobalSettingsScreen") < app.indexOf("<AboutScreen"));
   const ids = [...text.slice(text.indexOf("function appSettingsSections"), text.indexOf("function AppSettingsFocus")).matchAll(/id: "([^"]+)"/g)].map((match) => match[1]);
-  assert.equal(ids.length, 6);
-  for (const id of ids) assert.match(text, new RegExp(`id="${id}"`));
+  assert.equal(ids.length, 7);
+  // 「配置体检」的分组卡片由 ConfigDoctorPanel 自带，其余都在 App.tsx 里。
+  const sections = `${text}\n${readSource("./ConfigDoctorPanel.tsx")}`;
+  for (const id of ids) assert.match(sections, new RegExp(`id="${id}"`));
 });
 
 test("Computer Use 工作原理图与网关总览同一套三列拓扑", () => {
@@ -539,7 +551,7 @@ test("首次入门清单与可选导览分开；模式确认后显示清单，�
   // 使用模式问卷先弹，答完才进引导。
   assert.match(app, /\{agentFocusOpen \? <AgentFocusDialog initial=\{agentFocus\} onDone=\{closeAgentFocus\} onCancel=\{cancelAgentFocus\} \/> : null\}/);
   assert.match(app, /\{tourOpen && !agentFocusOpen \? <OnboardingTour focus=\{agentFocus\} onClose=\{closeTour\} \/> : null\}/);
-  assert.match(app, /setupOpen && !agentFocusOpen \? \(\s*<OnboardingSetup/);
+  assert.match(app, /setupOpen && !agentFocusOpen && !agentFocusChecking \? \(\s*<OnboardingSetup/);
   assert.match(app, /window\.localStorage\.setItem\(TOUR_STORAGE_KEY, String\(TOUR_VERSION\)\)/);
   assert.match(functionSource("initialSetupOpen"), /has\("previewRoute"\)/);
   assert.match(functionSource("initialSetupOpen"), /shouldShowSetup\(/);
@@ -686,4 +698,38 @@ test("供应商详情页不再 absolute 盖住吸顶标题：打开时 .screen �
   assert.match(rule, /position: relative;/);
   assert.match(rule, /inset: auto;/);
   assert.match(rule, /flex: 1 1 auto;/);
+});
+
+test("侧栏 Claude 播放键读 claude_local_status / claude_local_action，不做轮询", () => {
+  const entry = functionSource("App");
+  // App 传进侧栏的是一份轻量状态：running / busy / unavailableReason + 启停回调。
+  assert.match(entry, /claudeRun=\{claudeRun\}/);
+  // 代理活着、或 Claude 还挂在我们的代理端口上（代理已退）都算在跑，按钮才会给「停止」。
+  assert.match(entry, /const claudeAttached = Boolean\(claudeRunStatus\?\.running \|\| claudeRunStatus\?\.localProcess\);/);
+  assert.match(entry, /const claudeRun = \{\n\s*running: claudeAttached,/);
+  assert.match(entry, /unavailableReason: !claudeRunStatus\n\s*\? null/);
+  assert.match(entry, /onStart: \(\) => void claudeLocalRunAction\("launch"\),\n\s*onStop: \(\) => void claudeLocalRunAction\("stop"\),/);
+  // 探测一次就够：读状态要查进程和钥匙串，App 层不轮询。
+  assert.match(entry, /invoke<CommandResult<ClaudeLocalStatus>>\("claude_local_status"\)/);
+  assert.match(entry, /invoke<CommandResult<ClaudeLocalStatus>>\("claude_local_action", \{ action \}\)/);
+  assert.doesNotMatch(
+    entry.slice(entry.indexOf("const refreshClaudeLocalRun"), entry.indexOf("const claudeRunStatus")),
+    /setTimeout|setInterval/,
+  );
+  // Claude 正开着时 launch 会被后端拒绝，前端直接置灰并给原因。
+  assert.match(entry, /Claude 正在运行，请先完全退出，再从 Codex\+\+ 启动/);
+});
+
+test("「Agent 接入」的 Codex 行复用同一份启动状态；Claude 页把新状态回传给 App 的侧栏键", () => {
+  const entry = functionSource("App");
+  // 只穿一层：App → GatewayPage → AgentsView，总览的接入弹窗不传就不显示按钮。
+  assert.match(entry, /<GatewayPage[\s\S]*?codexRun=\{codexRun\}/);
+  const gatewayPage = readSource("./GatewayPage.tsx");
+  assert.match(gatewayPage, /codexRun\?: CodexRunControls/);
+  assert.match(gatewayPage, /<AgentsView busy=\{busy\} codexRun=\{codexRun\}/);
+  // 页面里启动 / 停止后回调把状态交给 App，侧栏按键不用轮询。
+  assert.match(entry, /onLocalStatus=\{\(status\) => \{/);
+  assert.match(entry, /claudeLocalMemo\.status = status;/);
+  assert.match(entry, /setClaudeLocalRun\(\(current\) => \(sameClaudeRunState\(current, status\) \? current : status\)\)/);
+  assert.match(text, /function sameClaudeRunState\(/);
 });

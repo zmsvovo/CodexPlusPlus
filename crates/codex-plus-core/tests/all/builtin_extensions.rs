@@ -60,6 +60,10 @@ fn builtins_with_a_setting_use_that_setting_as_their_switch() {
     assert_eq!(builtin(&manager, "paste-fix")["restartRequired"], false);
     assert_eq!(builtin(&manager, "force-chinese-locale")["restartRequired"], true);
     assert_eq!(builtin(&manager, "session-delete")["enabled"], true);
+    // prompt 参数展开只在带参数发送已有 prompt 时介入，默认开；改设置不用重启。
+    assert_eq!(builtin(&manager, "prompt-args")["enabled"], true);
+    assert_eq!(builtin(&manager, "prompt-args")["setting"], "codexAppPromptArgs");
+    assert_eq!(builtin(&manager, "prompt-args")["restartRequired"], false);
     assert_eq!(builtin(&manager, "session-delete")["params"], json!(["codexAppSessionDeleteSkipConfirm"]));
 
     manager.set_script_enabled("builtin:paste-fix", true).unwrap();
@@ -78,6 +82,48 @@ fn builtins_with_a_setting_use_that_setting_as_their_switch() {
     let state = manager.builtin_extension_state().unwrap();
     assert_eq!(state["disabled"], json!([]));
     assert!(manager.load_config().scripts.keys().all(|key| !key.starts_with("builtin:")));
+}
+
+#[test]
+fn reported_usage_compaction_defaults_off_and_persists_without_enabling_proxy() {
+    use codex_plus_core::settings::BackendSettings;
+    let defaults = BackendSettings::default();
+    assert!(!defaults.codex_app_reported_usage_compaction);
+    let legacy: BackendSettings = serde_json::from_value(json!({})).unwrap();
+    assert!(!legacy.codex_app_reported_usage_compaction);
+    let imported: BackendSettings =
+        serde_json::from_value(json!({"codexAppReportedUsageCompaction": true})).unwrap();
+    assert!(imported.codex_app_reported_usage_compaction);
+    assert_eq!(serde_json::to_value(imported).unwrap()["codexAppReportedUsageCompaction"], true);
+
+    let temp = tempfile::tempdir().unwrap();
+    let manager = manager(temp.path());
+    let before = settings(temp.path());
+    assert_eq!(builtin(&manager, "reported-usage-compaction")["enabled"], false);
+    assert_eq!(builtin(&manager, "reported-usage-compaction")["setting"], "codexAppReportedUsageCompaction");
+    manager.set_script_enabled("builtin:reported-usage-compaction", true).unwrap();
+    let enabled = settings(temp.path());
+    assert_eq!(enabled["codexAppReportedUsageCompaction"], true);
+    for key in ["relayProfiles", "relayProfilesEnabled", "codexAppAutoTakeover"] {
+        assert_eq!(enabled[key], before[key], "{key} must not change when enabling this experiment");
+    }
+    manager.set_script_enabled("builtin:reported-usage-compaction", false).unwrap();
+    assert_eq!(settings(temp.path())["codexAppReportedUsageCompaction"], false);
+}
+
+#[test]
+fn reported_usage_compaction_is_master_gated_and_yields_to_builtin_replacement() {
+    use codex_plus_core::builtin_takeover::mask_settings_with;
+    use codex_plus_core::settings::BackendSettings;
+    let def = codex_plus_core::settings_catalog::builtin_extension_def("reported-usage-compaction").unwrap();
+    assert!(def.master_gated);
+    assert!(def.replaceable);
+    let mut settings = BackendSettings::default();
+    settings.enhancements_enabled = true;
+    settings.codex_app_reported_usage_compaction = true;
+    let replaced = ["reported-usage-compaction".to_string()].into();
+    assert!(!mask_settings_with(settings.clone(), &replaced).codex_app_reported_usage_compaction);
+    assert!(mask_settings_with(settings, &Default::default()).codex_app_reported_usage_compaction);
 }
 
 #[test]

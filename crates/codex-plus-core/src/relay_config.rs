@@ -725,6 +725,9 @@ fn resolve_synced_chatgpt_tokens(profile: &RelayProfile) -> SyncedChatgptTokens 
     let Ok(settings) = crate::settings::SettingsStore::default().load() else {
         return None;
     };
+    if settings.native_auth_selection.is_some() {
+        return None;
+    }
     let aggregate = settings
         .aggregate_relay_profiles
         .iter()
@@ -917,6 +920,9 @@ fn align_profile_model_with_active_goal_thread(home: &Path, profile: &RelayProfi
     else {
         return profile.clone();
     };
+    if !gateway_goal_model_available(profile, &goal_model) {
+        return profile.clone();
+    }
     let declared = relay_profile_model(profile).trim().to_string();
     if !declared.is_empty() && declared != model_list_head(profile) && declared != goal_model {
         return profile.clone();
@@ -928,6 +934,18 @@ fn align_profile_model_with_active_goal_thread(home: &Path, profile: &RelayProfi
     next.config_contents =
         strip_tool_written_model_from_config(home, profile, &next.config_contents);
     next
+}
+
+fn gateway_goal_model_available(profile: &RelayProfile, model: &str) -> bool {
+    if profile.id != crate::gateway::apply::CODEX_GATEWAY_RELAY_ID
+        || !model.get(..crate::gateway::store::GROUP_MODEL_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(crate::gateway::store::GROUP_MODEL_PREFIX))
+    {
+        return true;
+    }
+    profile.model_list.split(['\r', '\n', ',']).any(|item| {
+        crate::model_suffix::parse_model_suffix(item).0.eq_ignore_ascii_case(model)
+    })
 }
 
 /// model_list 第一条（剥 catalog 后缀），与写入 config.toml 时的隐式默认一致。
@@ -1008,6 +1026,9 @@ pub fn align_live_config_model_with_goal_thread(
     else {
         return Ok(false);
     };
+    if !gateway_goal_model_available(profile, &goal_model) {
+        return Ok(false);
+    }
     if goal_model == live {
         return Ok(false);
     }
@@ -1121,6 +1142,29 @@ pub fn preserve_live_nonprovider_settings(home: &Path, config: &str) -> anyhow::
     if target.get("notify").is_none() {
         if let Some(notify) = live.get("notify") { target["notify"] = notify.clone(); }
     }
+    // opt-in（#3016）：MCP 条目由独立的 MCP 页管理，live 的形状是权威——
+    // 模板快照里的同 id 旧条目只是陈旧副本（例如旧 args 路径），用 live 覆盖。
+    // 例外：Codex++ / Codex 自己生成并按实例补全的条目以目标为准。
+    if let Some(live_servers) = live.get("mcp_servers").and_then(Item::as_table_like) {
+        for (id, item) in live_servers.iter() {
+            if CODEX_PLUS_OWNED_MCP_SERVER_IDS.contains(&id)
+                || !item
+                    .as_table_like()
+                    .is_some_and(mcp_server_entry_has_transport)
+            {
+                continue;
+            }
+            if target.get("mcp_servers").is_none() {
+                target["mcp_servers"] = toml_edit::table();
+            }
+            if let Some(target_servers) = target
+                .get_mut("mcp_servers")
+                .and_then(Item::as_table_like_mut)
+            {
+                target_servers.insert(id, item.clone());
+            }
+        }
+    }
     Ok(normalize_optional_toml(target))
 }
 
@@ -1133,6 +1177,8 @@ pub fn apply_relay_profile_to_home_with_switch_rules_and_proxy_port(
     common_config_contents: &str,
     proxy_port: u16,
 ) -> anyhow::Result<RelayApplyResult> {
+    let resolved_profile = crate::native_auth::resolve_profile_credentials(profile)?;
+    let profile = &resolved_profile;
     let previous_model = live_root_model(home);
     let result =
         apply_relay_profile_to_home_inner(home, profile, common_config_contents, proxy_port)?;
@@ -1337,8 +1383,11 @@ pub fn apply_pure_api_config_to_home_with_session_provider(
     let auth_contents = serde_json::to_string_pretty(&json!({
         "OPENAI_API_KEY": bearer_token
     }))?;
-    let backup_path =
-        write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()))?;
+    let backup_path = write_codex_live_atomic(
+        home,
+        Some(&updated),
+        Some(auth_contents.as_bytes()),
+    )?;
     let status = relay_config_status_from_home(home);
     Ok(RelayApplyResult {
         config_path: status.config_path,
@@ -1985,6 +2034,7 @@ fn recognized_managed_proxy_endpoint(profile: &RelayProfile, config: &str) -> bo
         || profile.rewrites_auto_review_model()
         || profile.strips_image_generation_tool()
         || profile.enables_pure_api_image_generation()
+        || profile.strips_responses_image_detail()
         || profile.relay_mode == RelayMode::Aggregate;
     let saved_endpoint_matches = provider_string_from_config(&profile.config_contents, "base_url")
         .is_some_and(|saved| {
@@ -2443,6 +2493,94 @@ pub fn delete_context_entry_from_common_config(
     Ok(normalize_optional_toml(doc))
 }
 
+/// `[[skills.config]]` 是 codex 现在的技能启停写法：一个数组，每项按 `path`（或 `name`）
+/// 标识一个技能。它和 `[mcp_servers.<id>]` / `[plugins.<id>]` 这种「按 id 分表」的结构不同，
+/// 不能把整个 `config` 当成一个 id 覆盖，否则用户自己写进去的条目会被模板里的几条顶掉（#3115）。
+const SKILLS_CONFIG_KEY: &str = "config";
+
+fn skill_config_entry_key(entry: &toml_edit::Table) -> Option<String> {
+    entry
+        .get("path")
+        .and_then(Item::as_str)
+        .map(str::to_string)
+        .or_else(|| entry.get("name").and_then(Item::as_str).map(str::to_string))
+}
+
+fn skill_config_entries_of(table: &toml_edit::Table) -> Vec<toml_edit::Table> {
+    table
+        .get(SKILLS_CONFIG_KEY)
+        .and_then(Item::as_array_of_tables)
+        .map(|entries| entries.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn write_skill_config_entries(table: &mut toml_edit::Table, entries: Vec<toml_edit::Table>) {
+    if entries.is_empty() {
+        table.remove(SKILLS_CONFIG_KEY);
+        return;
+    }
+    let mut array = toml_edit::ArrayOfTables::new();
+    for entry in entries {
+        array.push(entry);
+    }
+    table.insert(SKILLS_CONFIG_KEY, Item::ArrayOfTables(array));
+}
+
+/// 模板（managed）里的技能条目按 `path` / `name` 覆盖同名的 live 条目，其余 live 条目原样保留。
+fn merge_managed_skill_config(target: &mut toml_edit::Table, managed: &toml_edit::Table) {
+    let managed_entries = skill_config_entries_of(managed);
+    if managed_entries.is_empty() {
+        return;
+    }
+    let mut target_entries = skill_config_entries_of(target);
+    for managed_entry in managed_entries {
+        let key = skill_config_entry_key(&managed_entry);
+        match key.as_deref().and_then(|key| {
+            target_entries
+                .iter()
+                .position(|entry| skill_config_entry_key(entry).as_deref() == Some(key))
+        }) {
+            Some(index) => target_entries[index] = managed_entry,
+            None => target_entries.push(managed_entry),
+        }
+    }
+    write_skill_config_entries(target, target_entries);
+}
+
+/// 删掉模板里出现过的技能条目（同样按 `path` / `name` 匹配），其余保留。
+fn remove_managed_skill_config(target: &mut toml_edit::Table, managed: &toml_edit::Table) {
+    let managed_keys: std::collections::HashSet<String> = skill_config_entries_of(managed)
+        .iter()
+        .filter_map(skill_config_entry_key)
+        .collect();
+    if managed_keys.is_empty() {
+        return;
+    }
+    let mut entries = skill_config_entries_of(target);
+    entries.retain(|entry| {
+        skill_config_entry_key(entry).is_none_or(|key| !managed_keys.contains(&key))
+    });
+    write_skill_config_entries(target, entries);
+}
+
+/// 把 live 里模板没有的技能条目补回目标（同一个技能以模板为准）。
+fn preserve_unmanaged_skill_config(target: &mut toml_edit::Table, live: &toml_edit::Table) {
+    let live_entries = skill_config_entries_of(live);
+    if live_entries.is_empty() {
+        return;
+    }
+    let mut target_entries = skill_config_entries_of(target);
+    let existing: std::collections::HashSet<String> =
+        target_entries.iter().filter_map(skill_config_entry_key).collect();
+    for entry in live_entries {
+        match skill_config_entry_key(&entry) {
+            Some(key) if existing.contains(&key) => {}
+            _ => target_entries.push(entry),
+        }
+    }
+    write_skill_config_entries(target, target_entries);
+}
+
 /// 剥掉通用配置里供应商各自持有的键，丢掉历史遗留的 `[skills.<id>]` 死表，
 /// 再丢掉标记为 `enabled = false` 的上下文条目，得到本次切换真正要合并进
 /// config.toml 的那份通用配置。
@@ -2569,11 +2707,21 @@ fn merge_managed_context_table(
     if target.get(table_name).is_none() {
         target[table_name] = toml_edit::table();
     }
+    if table_name == "skills" {
+        if let (Some(target_plain), Some(managed_plain)) =
+            (target.get_mut(table_name).and_then(Item::as_table_mut), managed.get(table_name).and_then(Item::as_table))
+        {
+            merge_managed_skill_config(target_plain, managed_plain);
+        }
+    }
     let Some(target_table) = target.get_mut(table_name).and_then(Item::as_table_like_mut) else {
         target[table_name] = managed_item.clone();
         return;
     };
     for (id, item) in managed_table.iter() {
+        if table_name == "skills" && id == SKILLS_CONFIG_KEY {
+            continue;
+        }
         target_table.insert(id, item.clone());
     }
 }
@@ -2595,10 +2743,20 @@ fn remove_managed_context_entry_table(
     let Some(managed_table) = managed_item.as_table_like() else {
         return;
     };
+    if table_name == "skills" {
+        if let (Some(target_plain), Some(managed_plain)) =
+            (target.get_mut(table_name).and_then(Item::as_table_mut), managed.get(table_name).and_then(Item::as_table))
+        {
+            remove_managed_skill_config(target_plain, managed_plain);
+        }
+    }
     let Some(target_table) = target.get_mut(table_name).and_then(Item::as_table_like_mut) else {
         return;
     };
     for (id, _) in managed_table.iter() {
+        if table_name == "skills" && id == SKILLS_CONFIG_KEY {
+            continue;
+        }
         target_table.remove(id);
     }
 }
@@ -2628,6 +2786,14 @@ fn preserve_unmanaged_context_table(
     if target.get(table_name).is_none() {
         target[table_name] = toml_edit::table();
     }
+    if table_name == "skills" {
+        if let (Some(target_plain), Some(live_plain)) = (
+            target.get_mut(table_name).and_then(Item::as_table_mut),
+            live.get(table_name).and_then(Item::as_table),
+        ) {
+            preserve_unmanaged_skill_config(target_plain, live_plain);
+        }
+    }
     let Some(target_table) = target.get_mut(table_name).and_then(Item::as_table_like_mut) else {
         return;
     };
@@ -2642,14 +2808,36 @@ fn preserve_unmanaged_context_table(
         })
         .unwrap_or_default();
     for (id, item) in live_table.iter() {
+        if table_name == "skills" && id == SKILLS_CONFIG_KEY {
+            continue;
+        }
         if !managed_ids.contains(id) && target_table.get(id).is_none() {
             target_table.insert(id, item.clone());
         }
     }
 }
 
+/// 以目标（模板）为准、不被 live 同 id 旧副本覆盖的 `[mcp_servers.<id>]`：
+/// Codex 桌面版自己的 `codex_app`（端口随实例生成），以及 Codex++ 托管的 MCP 条目
+/// （协作 / dsh 插件 / 拓展创作 / 电脑控制，各自的 `ManagedMcp.server_id`）——
+/// 这些条目由生成方按当前实例补全，live 里的旧端口 / 旧路径是过期值（#3016）。
+const CODEX_PLUS_OWNED_MCP_SERVER_IDS: &[&str] = &[
+    "codex_app",
+    crate::agent_collaboration::integration::SERVER_ID,
+    crate::dsh_plugins::SERVER_ID,
+    crate::extension_creator::SERVER_ID,
+    crate::extension_creator::LEGACY_SERVER_ID,
+    crate::computer_use::SERVER_ID,
+    crate::computer_use::BROWSER_SERVER_ID,
+    crate::computer_use::CODEX_SERVER_ID,
+];
+
+/// 停用的托管条目不写进 live。只对 MCP（以及遗留的 `[skills.<id>]`）这样做：
+/// 插件不能删——Codex 把「config.toml 里没有 `[plugins."<id>"]`」当成「未安装」，
+/// 停用必须写成 `enabled = false`；删掉后内置插件（`*@openai-bundled`）会被 Codex
+/// 当作启用重新装回，界面上的停用、编辑成 `enabled = false` 也就都白做了（#3115）。
 fn remove_disabled_context_tables(table: &mut toml_edit::Table) {
-    for table_name in ["mcp_servers", "skills", "plugins"] {
+    for table_name in ["mcp_servers", "skills"] {
         let Some(item) = table.get_mut(table_name) else {
             continue;
         };
@@ -2674,9 +2862,32 @@ fn write_codex_live_atomic(
     config_text: Option<&str>,
     auth_bytes: Option<&[u8]>,
 ) -> anyhow::Result<Option<String>> {
+    write_codex_live_atomic_with(home, config_text, auth_bytes, crate::settings::atomic_write)
+}
+
+fn write_codex_live_atomic_with(
+    home: &Path,
+    config_text: Option<&str>,
+    auth_bytes: Option<&[u8]>,
+    mut write: impl FnMut(&Path, &[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<Option<String>> {
+    let _guard = crate::official_login::native_auth_write_guard(home)?;
     std::fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
     let auth_path = home.join("auth.json");
+    let old_auth = read_optional_bytes(&auth_path)?;
+    let apply_native_selection = crate::native_auth::is_default_home(home)
+        && SettingsStore::default().load()?.native_auth_selection.is_some();
+    let auth_bytes = auth_bytes.or_else(|| {
+        apply_native_selection.then(|| old_auth.as_deref().unwrap_or(b"{}"))
+    });
+    let projected_auth = auth_bytes
+        .map(|bytes| {
+            let proposed = std::str::from_utf8(bytes).context("auth.json 不是有效 UTF-8")?;
+            crate::native_auth::project_native_auth(home, proposed).map(String::into_bytes)
+        })
+        .transpose()?;
+    let auth_bytes = projected_auth.as_deref();
     #[cfg(windows)]
     let normalized_config_text = config_text.map(normalize_config_text_for_write);
     #[cfg(windows)]
@@ -2705,23 +2916,37 @@ fn write_codex_live_atomic(
     }
 
     let old_config = read_optional_bytes(&config_path)?;
-    let old_auth = read_optional_bytes(&auth_path)?;
     let backup_path = create_live_backup(home, old_config.as_deref(), old_auth.as_deref())?;
     let mut auth_written = false;
 
     if let Some(auth_bytes) = auth_bytes {
-        if let Err(error) = crate::settings::atomic_write(&auth_path, auth_bytes) {
+        if read_optional_bytes(&auth_path)? != old_auth {
+            anyhow::bail!("原生登录已被其他进程更新，已停止覆盖，请重试");
+        }
+        if let Err(error) = write(&auth_path, auth_bytes) {
             return Err(error.context("写入 auth.json 失败"));
         }
         auth_written = true;
     }
 
     if let Some(config_text) = config_text {
-        if let Err(error) = crate::settings::atomic_write(&config_path, config_text.as_bytes()) {
-            if auth_written {
-                let _ = restore_optional_file(&auth_path, old_auth.as_deref());
+        let result = (|| {
+            if read_optional_bytes(&config_path)? != old_config {
+                anyhow::bail!("config.toml 已被其他进程更新，已停止覆盖，请重试");
             }
-            let _ = restore_optional_file(&config_path, old_config.as_deref());
+            write(&config_path, config_text.as_bytes())
+        })();
+        if let Err(error) = result {
+            if auth_written
+                && read_optional_bytes(&auth_path)
+                    .is_ok_and(|current| current.as_deref() == auth_bytes)
+            {
+                if let Err(restore_error) = restore_optional_file(&auth_path, old_auth.as_deref()) {
+                    return Err(error.context(format!("写入 config.toml 失败；恢复 auth.json 也失败：{restore_error}")));
+                }
+            }
+            // atomic_write leaves the previous config intact on failure. Never overwrite
+            // another process's config or newer OAuth generation with a stale backup.
             return Err(error.context("写入 config.toml 失败"));
         }
     }
@@ -3651,6 +3876,56 @@ fn preserve_missing_table_keys(
     }
 }
 
+/// 多开实例（#3144）：`[windows]`（Windows 沙箱实现 elevated / unelevated 等）以主实例
+/// **当前** live config 为准。
+///
+/// 供应商 profile 的 `config_contents` 是回填时整份 live config 的快照，会连带当时的
+/// `[windows]` 一起存下来。主实例切换时 live 优先（[`preserve_live_app_settings`]），这份
+/// 旧值从不生效；但多开实例的 codex-home 第一次写入时没有 live，快照里的旧值（例如主实例
+/// 早已改成 unelevated、快照里还是 elevated）就原样落进实例，之后又被当成实例自己的
+/// live 一直保留。结果同一台机器上主实例与多开实例的沙箱实现不一致。
+///
+/// 规则：
+/// - 主实例有 `[windows]`：整段沿用主实例的（只改多开实例，不碰主实例）；
+/// - 主实例没有：保留多开实例写入前自己的 `[windows]`（`instance_live_before` 是写入
+///   前读到的实例 config.toml 文本，没有就传空串）；
+/// - 两边都没有：去掉写入时从 profile 快照带进来的 `[windows]`，交给 Codex 自己决定。
+///
+/// 返回是否改写了实例的 config.toml。
+pub fn align_isolated_instance_windows_settings(
+    instance_home: &Path,
+    main_home: &Path,
+    instance_live_before: &str,
+) -> anyhow::Result<bool> {
+    fn windows_table(text: &str) -> Option<Item> {
+        let doc = parse_toml_document(&normalize_duplicate_toml_text(text)).ok()?;
+        doc.get("windows")
+            .filter(|item| item.is_table_like())
+            .cloned()
+    }
+    let main_live = read_optional_text(&main_home.join("config.toml")).unwrap_or_default();
+    let desired = windows_table(&main_live).or_else(|| windows_table(instance_live_before));
+    let config_path = instance_home.join("config.toml");
+    let current = read_optional_text(&config_path)?;
+    let mut doc = parse_toml_document(&current)?;
+    let changed = match desired {
+        Some(windows) => {
+            let same = doc
+                .get("windows")
+                .is_some_and(|existing| existing.to_string() == windows.to_string());
+            if !same {
+                doc["windows"] = windows;
+            }
+            !same
+        }
+        None => doc.as_table_mut().remove("windows").is_some(),
+    };
+    if changed {
+        crate::settings::atomic_write(&config_path, normalize_optional_toml(doc).as_bytes())?;
+    }
+    Ok(changed)
+}
+
 /// Normal-user launches cannot complete the elevated native Windows sandbox
 /// setup. Downgrade only that case; an elevated process keeps the user's mode.
 pub fn ensure_windows_sandbox_usable_for_current_user(home: &Path) -> anyhow::Result<bool> {
@@ -4173,6 +4448,7 @@ pub(crate) fn managed_catalog_pointer(home: &Path, relative: &str, config: &str)
 
 /// 只迁移当前 home 内的受管目录，不重放供应商配置或改写用户外部目录。
 /// 原生 Windows 需要绝对路径（#2529），WSL 则保留共享 home 下的相对路径（#2591）。
+/// 升级时另发一份无固定窗口上限的目录，让随后启动的进程支持上下文热更新。
 pub fn migrate_managed_model_catalog_pointer_in_home(
     home: &Path,
     settings: &BackendSettings,
@@ -4236,11 +4512,45 @@ pub fn migrate_managed_model_catalog_pointer_in_home(
             return Ok(false);
         }
     }
+    let catalog_text = std::fs::read_to_string(&catalog_path).context("读取待升级模型目录失败")?;
+    let mut catalog: Value = serde_json::from_str(&catalog_text).context("解析待升级模型目录失败")?;
+    let models = catalog.get_mut("models").and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("待升级模型目录缺少 models 数组"))?;
+    let mut context_changed = false;
+    for model in models {
+        if model.get("max_context_window").is_some_and(Value::is_number) {
+            model["max_context_window"] = Value::Null;
+            context_changed = true;
+        }
+    }
+    let relative = if context_changed {
+        // 旧目录可能正被其他进程读取，也可能是聚合目录的不可变发布产物。
+        let migrated_bytes = serde_json::to_vec_pretty(&catalog)?;
+        let digest = format!("{:x}", sha2::Sha256::digest(&migrated_bytes));
+        let migrated = Path::new("model-catalogs").join(format!(
+            "{}-context-{}.json",
+            catalog_path.file_stem().unwrap().to_string_lossy(),
+            digest,
+        ));
+        let migrated_path = home.join(&migrated);
+        match std::fs::read(&migrated_path) {
+            Ok(existing) if existing == migrated_bytes => {}
+            Ok(_) => anyhow::bail!("已存在的升级模型目录内容不匹配"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::settings::atomic_write(&migrated_path, &migrated_bytes)
+                    .context("发布升级后的模型目录失败")?;
+            }
+            Err(error) => return Err(error).context("读取升级后的模型目录失败"),
+        }
+        migrated
+    } else {
+        relative.to_path_buf()
+    };
     let pointer = managed_catalog_pointer(home, &relative.to_string_lossy(), &contents)?;
     if raw_path == pointer { return Ok(false); }
     doc["model_catalog_json"] = toml_edit::value(pointer);
     crate::settings::atomic_write(&config_path, doc.to_string().as_bytes())
-        .context("迁移模型 catalog 绝对路径失败")?;
+        .context("更新升级后的模型目录指针失败")?;
     Ok(true)
 }
 
@@ -4266,12 +4576,15 @@ fn apply_model_catalog_to_config_with_live_policy(
         validate_managed_model_catalog(&catalog_json)?;
     crate::settings::atomic_write(&catalog_path, catalog_json.as_bytes())?;
         let mut doc = parse_toml_document(&config_text)?;
+        // config.toml 没有 model 时补一个：优先取默认成员的模型（#2958）。
+        // 目录按成员顺序输出，默认成员不一定排第一，直接取 first() 会落到别家的 cpx- 模型上。
         if root_key_string(&config_text, "model").is_none()
             && let Ok(catalog) = serde_json::from_str::<Value>(&catalog_json)
-            && let Some(default_model) = catalog
-                .get("models")
-                .and_then(Value::as_array)
-                .and_then(|models| models.first())
+            && let Some(models) = catalog.get("models").and_then(Value::as_array)
+            && let Some(default_model) = models
+                .iter()
+                .find(|model| model["codex_plus_default"].as_bool() == Some(true))
+                .or_else(|| models.first())
                 .and_then(|model| model.get("slug"))
                 .and_then(Value::as_str)
         {
@@ -4952,6 +5265,23 @@ pub(crate) fn upstream_rejects_tool_search(profile: &RelayProfile) -> bool {
     .any(|base_url| kimi_official_base_url(base_url))
 }
 
+/// Kimi 官方（Moonshot 开放平台 / Kimi For Coding）的 Responses 接口只认
+/// `reasoning.encrypted_content`，Codex 客户端私有的 `output.encrypted_content`
+/// 会让整单 400（issue #3026）。官方 ChatGPT 路径不受影响。
+pub(crate) fn upstream_is_kimi_official_responses(profile: &RelayProfile) -> bool {
+    if profile.protocol != RelayProtocol::Responses {
+        return false;
+    }
+    let resolved_base_url = relay_profile_base_url(profile);
+    [
+        profile.base_url.as_str(),
+        profile.upstream_base_url.as_str(),
+        resolved_base_url.as_str(),
+    ]
+    .iter()
+    .any(|base_url| kimi_official_base_url(base_url))
+}
+
 fn kimi_official_base_url(base_url: &str) -> bool {
     let host = base_url
         .trim()
@@ -5215,7 +5545,7 @@ fn is_cc_switch_model_catalog(path: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case(CC_SWITCH_MODEL_CATALOG_FILENAME))
 }
 
-fn is_codex_plus_managed_model_catalog(home: &Path, path: &str) -> bool {
+pub(crate) fn is_codex_plus_managed_model_catalog(home: &Path, path: &str) -> bool {
     let normalized = path.trim().replace('\\', "/");
     let relative = normalized.trim_start_matches("./");
     if relative.to_ascii_lowercase().starts_with("model-catalogs/") {
@@ -5398,7 +5728,18 @@ fn merge_toml_item(target: &mut Item, source: &Item) {
             return;
         }
     }
-
+    // 数组表（[[table]]）重复出现时必须按条目追加，不能整棵替换：
+    // 每个独立的 [[skills.config]] 块只含一个条目，逐块合并阶段整棵覆盖会把
+    // N 条用户规则塌缩成最后出现的那 1 条（issue #3115：切换供应商后
+    // config.toml 里 260 条 [[skills.config]] 只剩最后写的 1 条）。
+    if let (Some(target_array), Some(source_array)) =
+        (target.as_array_of_tables_mut(), source.as_array_of_tables())
+    {
+        for entry in source_array.iter() {
+            target_array.push(entry.clone());
+        }
+        return;
+    }
     *target = source.clone();
 }
 
@@ -5930,7 +6271,7 @@ const MODEL_NAME_FORBIDDEN_KEYWORDS: [&str; 6] = [
     "model_catalog_json",
 ];
 
-fn sanitize_relay_model_name(raw: &str) -> Option<String> {
+pub(crate) fn sanitize_relay_model_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty()
         || trimmed.len() > MAX_MODEL_NAME_LEN
@@ -6010,6 +6351,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         || profile.rewrites_auto_review_model()
         || profile.strips_image_generation_tool()
         || profile.enables_pure_api_image_generation()
+        || profile.strips_responses_image_detail()
         || has_managed_proxy_config
     {
         if !profile.upstream_base_url.trim().is_empty() {
@@ -6392,6 +6734,7 @@ fn complete_relay_profile_config_with_proxy_port(
         || profile.rewrites_auto_review_model()
         || profile.strips_image_generation_tool()
         || profile.enables_pure_api_image_generation()
+        || profile.strips_responses_image_detail()
     {
         crate::protocol_proxy::local_responses_proxy_base_url(proxy_port)
     } else {
@@ -7034,6 +7377,61 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_config_write_recovers_only_the_auth_generation_written_by_this_transaction() {
+        for (previous, concurrent) in [
+            (Some(r#"{"tokens":{"access_token":"old"}}"#), None),
+            (None, None),
+            (Some(r#"{"tokens":{"access_token":"old"}}"#), Some(r#"{"tokens":{"access_token":"newer"}}"#)),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let auth_path = temp.path().join("auth.json");
+            let config_path = temp.path().join("config.toml");
+            let previous_config = "model = \"old\"\n";
+            std::fs::write(&config_path, previous_config).unwrap();
+            if let Some(previous) = previous {
+                std::fs::write(&auth_path, previous).unwrap();
+            }
+            let result = write_codex_live_atomic_with(
+                temp.path(), Some("model = \"new\"\n"), Some(br#"{"OPENAI_API_KEY":"test"}"#),
+                |path, bytes| {
+                    if path == config_path {
+                        if let Some(concurrent) = concurrent {
+                            std::fs::write(&auth_path, concurrent)?;
+                        }
+                        anyhow::bail!("synthetic config write failure");
+                    }
+                    crate::settings::atomic_write(path, bytes)
+                },
+            );
+            assert!(result.unwrap_err().to_string().contains("config.toml"));
+            assert_eq!(read_optional_bytes(&auth_path).unwrap(),
+                concurrent.or(previous).map(|contents| contents.as_bytes().to_vec()));
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), previous_config);
+        }
+    }
+
+    #[test]
+    fn concurrent_config_change_is_not_overwritten_and_auth_is_recovered() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let auth_path = temp.path().join("auth.json");
+        std::fs::write(&config_path, "model = \"old\"\n").unwrap();
+        let result = write_codex_live_atomic_with(
+            temp.path(), Some("model = \"ours\"\n"), Some(b"{}"),
+            |path, bytes| {
+                crate::settings::atomic_write(path, bytes)?;
+                if path == auth_path {
+                    std::fs::write(&config_path, "model = \"external\"\n")?;
+                }
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("config.toml"));
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "model = \"external\"\n");
+        assert!(!auth_path.exists());
+    }
 
     #[test]
     fn managed_session_provider_follows_effective_transport_without_selecting_it() {
@@ -7952,6 +8350,24 @@ command = \"pwsh -File end.ps1\"
             model, "\"gpt-5.6-luna-max\"",
             "未归档目标任务的模型应优先于 model_list 第一条"
         );
+    }
+
+    #[test]
+    fn gateway_goal_alignment_does_not_restore_an_unlisted_group() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("auth.json"), "{}\n").unwrap();
+        write_goal_thread_fixture_db(
+            temp.path(),
+            &[("t-goal", "group/fast")],
+            &[("t-goal", "2026-09-21T02:00:00Z", None)],
+        );
+        let mut profile = goal_drift_test_profile();
+        profile.id = crate::gateway::apply::CODEX_GATEWAY_RELAY_ID.to_string();
+        assert_eq!(apply_and_read_model(temp.path(), &profile), "\"astra-6-high\"");
+        assert!(!align_live_config_model_with_goal_thread(temp.path(), &profile).unwrap());
+        profile.model_list.push_str("\ngroup/fast[1M]");
+        assert!(align_live_config_model_with_goal_thread(temp.path(), &profile).unwrap());
+        assert_eq!(apply_and_read_model_config_line(temp.path()), "\"group/fast\"");
     }
 
     /// 对照组：没有未归档目标任务时保持旧行为（model_list 第一条），

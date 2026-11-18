@@ -38,7 +38,9 @@ fn provider(id: &str, models: &str) -> GatewayProvider {
         upstream_gone: Vec::new(),
         models_checked_at_ms: 0,
         newapi_access: None,
+            subscription_policy: None,
         upstream_meta: Default::default(),
+        auto_compact: Default::default(),
         relay: RelayProfile {
             id: id.to_string(),
             name: id.to_string(),

@@ -64,6 +64,45 @@ fn dictation_renderer_contract_harness() {
     );
 }
 
+/// Codex++ 设置页的分组导航（40-backend-settings.js）：左栏列哪些分组、切换与记住选择。
+#[test]
+fn settings_groups_renderer_harness() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("core crate should live under crates/codex-plus-core");
+    let output = Command::new("node")
+        .arg("--test")
+        .arg(repo.join("assets/inject/settings-groups.test.cjs"))
+        .output()
+        .expect("node should run the settings groups harness");
+    assert!(
+        output.status.success(),
+        "settings groups harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Codex++ 设置页里的语音输入 / 下一步建议服务配置与原生浏览器状态（46-service-settings.js）。
+#[test]
+fn service_settings_renderer_harness() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("core crate should live under crates/codex-plus-core");
+    let output = Command::new("node")
+        .arg(repo.join("assets/inject/service-settings.test.cjs"))
+        .output()
+        .expect("node should run the service settings harness");
+    assert!(
+        output.status.success(),
+        "service settings harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn screenshot_command_uses_png_from_surface() {
     assert_eq!(
@@ -502,7 +541,8 @@ fn injection_script_no_longer_carries_the_image_overlay() {
     let script = assets::injection_script_with_settings(57321, &settings);
 
     assert!(!script.contains("__CODEX_PLUS_IMAGE_OVERLAY__"));
-    assert!(!script.contains("data:image/png;base64,iVBORw0KGgo"));
+    // 只查这张叠加图本身：脚本里另有 Codex++ 自己的 logo（也是 PNG data URL），不能按前缀一刀切。
+    assert!(!script.contains("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"));
     assert!(!script.contains("/overlay/image"));
     assert!(!script.contains("function installCodexPlusImageOverlay"));
 }
@@ -1427,12 +1467,13 @@ fn stepwise_records_only_real_bridge_generation_requests() {
 }
 
 #[test]
-fn stepwise_opens_manager_as_transient_window() {
+fn stepwise_config_opens_codex_settings_page_not_manager() {
     let script = assets::stepwise_script();
 
-    assert!(script.contains("bridgeCall(\"/manager/open-transient\", {"));
-    assert!(script.contains("page: \"enhance\""));
-    assert!(script.contains("section: \"stepwise\""));
+    // 服务配置已搬进 Codex 里的 Codex++ 设置页，「配置」不再打开管理器。
+    assert!(script.contains("window.__codexPlusOpenServiceSettings"));
+    assert!(script.contains("open(\"stepwise\")"));
+    assert!(!script.contains("/manager/open-transient"));
 }
 
 #[test]
@@ -2829,7 +2870,8 @@ fn injection_script_heartbeat_syncs_backend_settings() {
     // 心跳在健康时顺带刷新后端设置，让 manager 侧的改动能传播到已运行窗口（issue #2221）。
     assert!(script.contains("function syncBackendSettingsFromHeartbeat"));
     assert!(script.contains("syncBackendSettingsInFlight"));
-    assert!(script.contains("void syncBackendSettingsFromHeartbeat();"));
+    assert!(script.contains("void syncBackendSettingsFromHeartbeat().then((loaded) =>"));
+    assert!(script.contains("if (loaded && codexPlusBackendGeneration === window.__codexPlusBackendGeneration)"));
     // 跟着设置走的功能由内置拓展订阅 settings/loaded（对话宽度开关变了就重算宽度）。
     // 心跳还带上变了的设置字段名，并比较供应商发 relayProfile/switched、modelCatalog/changed。
     assert!(script.contains("emitCodexPlusSettingsLoaded(\"heartbeat\", "));
@@ -3041,10 +3083,14 @@ fn injection_script_guards_temporary_new_thread_ids_before_delete() {
     assert!(script.contains(
         "? canonicalHrefId || (!hrefIsTemporary ? reactConversationIdFromRow(row) : \"\")"
     ));
-    // 删除是内置拓展注册的行内会话行操作：点击时按当下的行重新解析会话（临时 id 不删）。
+    // 正式会话按当下的行解析；临时 id 走原生 pending 清理，不发送到持久会话删除接口。
     assert!(script.contains("onActivate: ({ row, button, event }) => openDeleteConfirmForRow(row, button, sessionRefFromRow(row), event)"));
-    assert!(script.contains("会话仍在同步，请稍后重试"));
-    assert!(script.contains("attributeFilter: [\"data-app-action-sidebar-thread-id\", \"href\"]"));
+    assert!(script.contains("return deleteUncreatedSession(row, button);"));
+    assert!(script.contains("function uncreatedSessionActionFromRow(row)"));
+    // 会话切换后历史容器上的 conversation id 也会变，观察器要跟着重扫（#3126 的阅读位置对齐）。
+    assert!(script.contains(
+        "attributeFilter: [\"data-app-action-sidebar-thread-id\", \"href\", \"data-above-composer-conversation-id\"]"
+    ));
 
     let cases = run_session_ref_contract_harness();
     assert_eq!(
@@ -3373,7 +3419,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"33\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"48\""));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -3386,7 +3432,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("modelWhitelistUnlock"));
     assert!(!script.contains("|| settingsResp.relayProfiles[0]"));
     assert!(script.contains("refreshCodexModelWhitelistFromScan"));
-    assert!(script.contains("codexPlusModelListRequestIds.size === 0"));
+    assert!(script.contains("codexPlusModelListRequests.has(requestId)"));
     assert!(!script.contains("function patchReactModelState"));
     assert!(!script.contains("function patchObjectGraphForModels"));
     assert!(!script.contains("window.dispatchEvent = function patchedCodexPlusDispatchEvent"));
@@ -3429,6 +3475,7 @@ const modelReasoningEfforts = () => [];
 const applyCodexPlusModelMetadata = () => false;
 const codexPlusModelNames = () => ["supplier-default", "extra-model"];
 let relayMode = "official";
+const window = {{}};
 const codexRemoteSessionActiveProfile = () => ({{ id: "custom", relayMode }});
 const codexPlusModelUnlockEnabled = () => true;
 const codexPlusBackendSettingsLoaded = true;
@@ -3525,7 +3572,7 @@ fn injection_script_keeps_remote_provider_patch_installed_for_openai_identity() 
 
     assert!(script
         .contains("codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled()"));
-    assert!(script.contains("if (!codexRemoteSessionProviderPatchEnabled()) return;"));
+    assert!(script.contains("if (!codexRemoteSessionProviderPatchEnabled()\n        && !(codexPlusBackendSettingsLoaded && codexPlusBackendSettings.providerSyncEnabled)) return;"));
 }
 
 #[test]
@@ -3725,15 +3772,10 @@ fn injection_script_preserves_native_tiers_and_shared_provider_contracts() {
         json!([
             "thread/start:model-old",
             "turn/start:model-old",
-            "thread/resume:model-new",
             "turn/start:model-new",
             "turn/start:"
         ])
     );
-    assert_eq!(cases["modelSwitchResumeProvider"], "sub2api");
-    assert_eq!(cases["failedModelSwitchResumeAttempts"], 2);
-    assert_eq!(cases["failedModelSwitchTurnAttempts"], 2);
-    assert_eq!(cases["delayedResumeWaited"], true);
     assert_eq!(cases["hungSettingsForwarded"], json!(["instance", "prototype"]));
     assert_eq!(cases["lateSettingsIgnored"], json!(["stale_vendor", "stale_vendor"]));
     assert_eq!(cases["turnCompletedBeforeCatalogRead"], true);
@@ -4429,50 +4471,6 @@ await modelSwitchClient.sendRequest("turn/start", {{
   input: [],
 }});
 const modelSwitchCallOrder = modelSwitchCalls.map((call) => `${{call.method}}:${{call.params?.model || ""}}`);
-const modelSwitchResumeProvider = modelSwitchCalls.find((call) => call.method === "thread/resume")?.params?.modelProvider || "";
-
-const failedModelSwitchCalls = [];
-const failedModelSwitchClient = {{
-  async sendRequest(method, params) {{
-    failedModelSwitchCalls.push({{ method, params }});
-    if (method === "thread/resume") throw new Error("synthetic resume failure");
-    return {{ ok: true }};
-  }},
-}};
-api.patchAppServerClient(failedModelSwitchClient);
-await failedModelSwitchClient.sendRequest("thread/start", {{
-  threadId: "thread-model-context-failure",
-  model: "model-old",
-}});
-await failedModelSwitchClient.sendRequest("turn/start", {{
-  threadId: "thread-model-context-failure",
-  model: "model-new",
-  input: [],
-}});
-await failedModelSwitchClient.sendRequest("turn/start", {{
-  threadId: "thread-model-context-failure",
-  model: "model-new",
-  input: [],
-}});
-const failedModelSwitchResumeAttempts = failedModelSwitchCalls.filter((call) => call.method === "thread/resume").length;
-const failedModelSwitchTurnAttempts = failedModelSwitchCalls.filter((call) => call.method === "turn/start").length;
-
-let finishDelayedResume;
-const delayedResumeCalls = [];
-const delayedResumeClient = {{
-  async sendRequest(method) {{
-    delayedResumeCalls.push(method);
-    return method === "thread/resume" ? new Promise((resolve) => {{ finishDelayedResume = resolve; }}) : {{ ok: true }};
-  }},
-}};
-api.patchAppServerClient(delayedResumeClient);
-await delayedResumeClient.sendRequest("thread/start", {{ threadId: "delayed-resume", model: "model-old" }});
-const delayedResumeTurn = delayedResumeClient.sendRequest("turn/start", {{ threadId: "delayed-resume", model: "model-new" }});
-await new Promise(setImmediate);
-const delayedResumeWaited = delayedResumeCalls.at(-1) === "thread/resume" && !delayedResumeCalls.includes("turn/start");
-finishDelayedResume({{ ok: true }});
-await delayedResumeTurn;
-
 async function expectNativeRequestCompletes(promise) {{
   let timeoutId;
   try {{
@@ -4734,10 +4732,6 @@ process.stdout.write(JSON.stringify({{
   pureApiRecoveryUnscheduled,
   pureOfficialProviderUnchanged,
   modelSwitchCallOrder,
-  modelSwitchResumeProvider,
-  failedModelSwitchResumeAttempts,
-  failedModelSwitchTurnAttempts,
-  delayedResumeWaited,
   hungSettingsForwarded,
   lateSettingsIgnored,
   turnCompletedBeforeCatalogRead,

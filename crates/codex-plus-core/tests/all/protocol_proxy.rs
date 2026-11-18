@@ -668,8 +668,10 @@ fn assert_local_compaction_summary(item: &Value, summary: &str) {
     );
 }
 
+/// 读不懂的压缩项（原生密文、旧格式、损坏的本地摘要）原先整条拒绝，#3106 起改为占位说明：
+/// 不把原文当摘要发出去，也不再让重放这段历史的每轮请求都失败。
 #[test]
-fn chat_conversion_rejects_unmarked_or_invalid_compaction_history() {
+fn chat_conversion_degrades_unmarked_or_invalid_compaction_history() {
     for content in [
         "OPAQUE_NATIVE",
         "unmarked legacy summary",
@@ -682,7 +684,13 @@ fn chat_conversion_rejects_unmarked_or_invalid_compaction_history() {
             json!({"type": "compaction", "encrypted_content": content}),
             json!([{"type": "compaction", "encrypted_content": content}]),
         ] {
-            assert!(responses_to_chat_completions(json!({"input": input})).is_err());
+            let converted = responses_to_chat_completions(json!({"input": input})).unwrap();
+            let messages = converted["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 1, "{content}");
+            assert_eq!(messages[0]["role"], "user");
+            let text = messages[0]["content"].as_str().unwrap();
+            assert!(text.contains("compacted by a different provider"), "{content}");
+            assert!(!text.contains(content), "原文不能当摘要发出: {content}");
         }
     }
 }
@@ -1060,6 +1068,30 @@ fn glm_image_urls_are_stripped_to_bare_base64() {
     assert_eq!(url, "QUJD");
 }
 
+/// #2991：带命名空间的 GLM（NVIDIA `z-ai/glm-5.3-flash`、OpenRouter 等聚合平台）
+/// 是标准 OpenAI 兼容接口，`image_url.url` 必须保留 data URL，不能剥成裸 base64。
+#[test]
+fn namespaced_glm_image_urls_keep_data_url_prefix() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "z-ai/glm-5.3-flash",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_image", "image_url": "data:image/png;base64,QUJD" }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let url = converted["messages"][0]["content"][0]["image_url"]["url"]
+        .as_str()
+        .expect("image part survives");
+    assert_eq!(url, "data:image/png;base64,QUJD");
+}
+
 /// 标准 data URL 上游（OpenAI 等）不能被这层改写波及。
 #[test]
 fn non_glm_image_urls_keep_data_url_prefix() {
@@ -1211,6 +1243,79 @@ async fn responses_compaction_v2_falls_back_when_trigger_is_rejected() {
         String::from_utf8(result.read_body().await.unwrap())
             .unwrap()
             .contains("COMPAT_SUMMARY")
+    );
+}
+
+/// #3101：「ChatGPT API」上游（ChatGPT 订阅共享）不收 compaction_trigger，报错只列白名单、
+/// 不点名 trigger。按错误码认出后要降级成摘要压缩，而不是把 400 交回 Codex。
+#[tokio::test]
+async fn responses_compaction_v2_falls_back_when_subscription_sharing_rejects_trigger() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..2 {
+            let (mut stream, _) = if index == 0 {
+                listener.accept().await.unwrap()
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("fallback request should arrive")
+                    .unwrap()
+            };
+            requests.push(
+                String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string(),
+            );
+            if index == 0 {
+                write_remote_compaction_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    r#"{"error":{"message":"User subscription sharing currently supports only text, image, and file messages, item references, additional tools, compaction summaries, reasoning items, Web Search call items, developer function and custom tool call items, and programmatic tool calling items. Remove unsupported input items or use an API key instead.","type":"invalid_request_error","param":"input","code":"subscription_sharing_unsupported_capability"}}"#,
+                )
+                .await;
+            } else {
+                write_remote_compaction_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"SHARING_SUMMARY"}]}]}"#,
+                )
+                .await;
+            }
+        }
+        requests
+    });
+
+    let mut result = open_responses_proxy_request_with_settings(
+        &json!({
+            "model": "gpt-6.1-sol",
+            "stream": true,
+            "input": [
+                { "type": "message", "role": "user", "content": "history" },
+                { "type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "call_1", "output": "ok" },
+                { "type": "compaction_trigger" }
+            ]
+        })
+        .to_string(),
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+    )
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+
+    assert_eq!(requests.len(), 2, "被订阅共享拒收后应降级重发一次");
+    assert!(requests[0].contains("compaction_trigger"));
+    assert!(!requests[1].contains("compaction_trigger"), "降级请求不再带 trigger");
+    assert!(requests[1].contains("CONTEXT CHECKPOINT COMPACTION"));
+    assert!(requests[1].contains("call_1"), "历史里的工具调用原样保留");
+    assert_eq!(result.status_code, 200);
+    assert!(result.compaction);
+    assert!(
+        String::from_utf8(result.read_body().await.unwrap())
+            .unwrap()
+            .contains("SHARING_SUMMARY")
     );
 }
 
@@ -1609,27 +1714,130 @@ async fn native_compaction_history_returns_responses_error_without_fallback() {
     assert!(body.contains("compaction_incompatible"));
 }
 
-#[tokio::test]
-async fn native_compaction_history_on_chat_upstream_returns_responses_error() {
-    let mut result = open_responses_proxy_request_with_settings(
-        &json!({
-            "model": "model",
-            "stream": false,
-            "input": [
-                { "type": "compaction", "encrypted_content": "OPAQUE_NATIVE" },
-                { "type": "compaction_trigger" }
-            ]
-        })
-        .to_string(),
-        remote_compaction_settings("http://127.0.0.1:9/v1", RelayProtocol::ChatCompletions),
-    )
-    .await
-    .expect("chat conversion refusal is a Responses error, not a proxy failure");
+/// 原生上游（官方账号）签发的加密压缩项样例：Fernet 密文 + 透传元数据（#3106）。
+fn native_fernet_compaction() -> Value {
+    json!({
+        "type": "compaction",
+        "id": "cmp_07348027",
+        "encrypted_content": "gAAAAABq9sH8Pd9Ajo0WqM8JpkiAX3_OPAQUE_NATIVE",
+        "internal_chat_message_metadata_passthrough": { "turn_id": "turn_1" }
+    })
+}
 
-    assert_eq!(result.status_code, 400);
-    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
-    assert!(body.contains("native_compaction_unsupported"));
-    assert!(body.contains("compaction_incompatible"));
+/// #3106：Chat 桥接上游没有其他候选可切时，历史里的原生加密压缩项换成占位说明继续发送，
+/// 普通对话和压缩请求本身都不再 400。原先这里断言「必须拒绝」（native_compaction_unsupported），
+/// 那会让每轮重放这段历史的请求都失败、会话永久锁死。
+#[tokio::test]
+async fn native_compaction_history_on_chat_upstream_degrades_to_placeholder() {
+    for trigger in [false, true] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(capture_request_with_response(
+            listener,
+            "application/json",
+            json!({
+                "id": "chatcmpl_degraded",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "CHAT_REPLY" },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string(),
+        ));
+        let mut input = vec![
+            native_fernet_compaction(),
+            json!({ "type": "message", "role": "user", "content": "继续" }),
+        ];
+        if trigger {
+            input.push(json!({ "type": "compaction_trigger" }));
+        }
+        let mut result = open_responses_proxy_request_with_settings(
+            &json!({ "model": "model", "stream": false, "input": input }).to_string(),
+            remote_compaction_settings(
+                &format!("http://{address}/v1"),
+                RelayProtocol::ChatCompletions,
+            ),
+        )
+        .await
+        .unwrap();
+        let (headers, sent) = server.await.unwrap();
+
+        assert_eq!(result.status_code, 200, "trigger={trigger}");
+        assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        let sent_text = sent.to_string();
+        assert!(!sent_text.contains("OPAQUE_NATIVE"), "密文不能发给桥接上游");
+        assert!(!sent_text.contains("internal_chat_message_metadata_passthrough"));
+        let messages = sent["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "user");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("compacted by a different provider"),
+            "占位说明留在原压缩项的位置: {sent}"
+        );
+        assert!(sent_text.contains("继续"), "其余历史照常转换");
+        assert_eq!(result.compaction, trigger);
+        let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+        assert!(body.contains("CHAT_REPLY"), "trigger={trigger}: {body}");
+        assert!(!body.contains("native_compaction_unsupported"));
+    }
+}
+
+/// #3106：转换函数本身（Chat 与 Anthropic 桥接共用的第一跳）遇到原生加密压缩项不再报错，
+/// 换成占位说明；本地摘要（codexplusplus:summary:v1:）仍展开成原文，工具调用配对不受影响。
+#[test]
+fn responses_to_chat_replaces_native_compaction_with_placeholder() {
+    let body = json!({
+        "model": "deepseek-v4-pro",
+        "input": [
+            native_fernet_compaction(),
+            {
+                "type": "compaction",
+                "encrypted_content": "codexplusplus:summary:v1:\"LOCAL_SUMMARY\""
+            },
+            { "type": "message", "role": "user", "content": "看一下目录" },
+            { "type": "function_call", "call_id": "call_1", "name": "ls", "arguments": "{}" },
+            { "type": "function_call_output", "call_id": "call_1", "output": "a.txt" }
+        ]
+    });
+    let converted = responses_to_chat_completions(body.clone()).unwrap();
+    let messages = converted["messages"].as_array().unwrap();
+    let text = converted.to_string();
+    assert!(!text.contains("OPAQUE_NATIVE"));
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be read under the current protocol")
+    );
+    assert!(messages[1]["content"].as_str().unwrap().contains("LOCAL_SUMMARY"));
+    assert!(text.contains("看一下目录"));
+    assert_eq!(messages.last().unwrap()["role"], "tool");
+    assert_eq!(messages.last().unwrap()["tool_call_id"], "call_1");
+
+    // 单个 item 形式的 input 同样降级。
+    let single = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-pro",
+        "input": native_fernet_compaction()
+    }))
+    .unwrap();
+    assert_eq!(single["messages"].as_array().unwrap().len(), 1);
+    assert!(!single.to_string().contains("OPAQUE_NATIVE"));
+
+    // Anthropic 桥接复用同一份第一跳转换，也不再整条拒绝。
+    let anthropic = codex_plus_core::anthropic_bridge::responses_to_anthropic_messages(
+        body,
+        &codex_plus_core::anthropic_bridge::AnthropicRequestOptions::default(),
+    )
+    .unwrap();
+    let anthropic_text = anthropic.to_string();
+    assert!(!anthropic_text.contains("OPAQUE_NATIVE"));
+    assert!(anthropic_text.contains("compacted by a different provider"));
 }
 
 #[test]
@@ -4414,6 +4622,45 @@ data: [DONE]
 }
 
 #[test]
+fn chat_sse_ignores_empty_tool_call_id_delta_after_valid_id() {
+    let converted = chat_sse_to_responses_sse(
+        r#"data: {"id":"chatcmpl_qwen_auto","model":"qwentokenplan/auto","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_qwen","type":"function","function":{"name":"exec","arguments":""}}]}}]}
+
+data: {"id":"chatcmpl_qwen_auto","model":"qwentokenplan/auto","choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"arguments":"{\"cmd\":"}}]}}]}
+
+data: {"id":"chatcmpl_qwen_auto","model":"qwentokenplan/auto","choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"arguments":"\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#,
+    );
+
+    let events = converted
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .collect::<Vec<_>>();
+    let tool_items = events
+        .iter()
+        .filter_map(|event| {
+            let item = event
+                .get("item")
+                .or_else(|| event.pointer("/response/output/0"))?;
+            (item["type"] == "function_call").then(|| item.clone())
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(tool_items.len(), 3, "应产出 added、done 和 completed 三个工具项");
+    for item in &tool_items {
+        assert_eq!(item["id"], "fc_call_qwen", "工具项 id 被空 id 增量污染：{item}");
+        assert_eq!(
+            item["call_id"], "call_qwen",
+            "工具项 call_id 被空 id 增量污染：{item}"
+        );
+    }
+}
+
+#[test]
 fn chat_sse_maps_custom_tool_call_with_request_context() {
     let converted = chat_sse_to_responses_sse_with_request(
         r#"data: {"id":"chatcmpl_custom","model":"gpt-5.4","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_custom","type":"function","function":{"name":"exec"}}]}}]}
@@ -4627,6 +4874,7 @@ fn upstream_header_timeout_is_bounded_for_hung_providers() {
     assert!(upstream_header_timeout() >= Duration::from_secs(30));
     assert!(upstream_header_timeout() <= Duration::from_secs(60));
     assert!(upstream_stream_header_timeout() >= Duration::from_secs(120));
+    assert!(upstream_stream_header_timeout() <= Duration::from_secs(3600));
 }
 
 #[tokio::test]
@@ -4960,6 +5208,133 @@ async fn aggregate_official_member_declares_web_search_for_tool_less_history() {
     assert_eq!(sent, expected, "只补搜索声明，历史内容必须原样保留");
 }
 
+/// 外层 API 缓存恢复工具，内层官方登录代理仍须识别本地摘要并补搜索声明。
+#[tokio::test]
+async fn official_local_compaction_repairs_cached_tools_across_two_proxy_hops_for_all_switches() {
+    let _lock = settings_path_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let _codex_home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
+    for (local, search) in [(false, false), (false, true), (true, false), (true, true)] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _base = EnvVarGuard::set(
+            "CODEX_PLUS_OFFICIAL_BASE_URL",
+            &format!("http://{address}/backend-api/codex"),
+        );
+        let official_server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                    .await.unwrap().unwrap();
+                let raw = read_http_request(&mut stream).await;
+                let request: Value = serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let has_search = request["tools"].as_array().is_some_and(|tools| {
+                    tools.iter().any(|tool| tool["type"] == "web_search")
+                });
+                let rejected = request["tool_choice"] == "none" && !has_search;
+                let (status, body) = if rejected {
+                    ("400 Bad Request", r#"{"error":{"message":"response protection is unavailable"}}"#)
+                } else {
+                    ("200 OK", r#"{"id":"resp_official","status":"completed","output":[]}"#)
+                };
+                write_remote_compaction_response(&mut stream, status, body).await;
+                requests.push(request);
+            }
+            requests
+        });
+        let official_settings = official_aggregate_test_settings(
+            &format!("official-cache-{local}-{search}"), &format!("official-cache-agg-{local}-{search}"),
+        );
+        let inner = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let inner_address = inner.local_addr().unwrap();
+        let gateway = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), inner.accept())
+                    .await.unwrap().unwrap();
+                let raw = read_http_request(&mut stream).await;
+                let request: Value = serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let mut result = open_responses_proxy_request_with_settings(
+                    &request.to_string(), official_settings.clone(),
+                ).await.unwrap();
+                let status = if result.status_code == 200 { "200 OK" } else { "400 Bad Request" };
+                let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+                write_remote_compaction_response(&mut stream, status, &body).await;
+                requests.push(request);
+            }
+            requests
+        });
+        let mut settings = single_relay_proxy_settings(&format!("http://{inner_address}/v1"));
+        settings.protocol_proxy_auto_retry = false;
+        settings.relay_profiles[0].local_compaction_prompt_at_end = local;
+        settings.relay_profiles[0].web_search_history_compat = search;
+        assert_eq!(settings.relay_profiles[0].local_compaction_prompt_at_end_enabled(), local);
+        let normal = json!({
+            "model":"gpt-6.1-sol","stream":false,"store":false,
+            "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+            "tool_choice":"required","parallel_tool_calls":true,
+            "input":[
+                {"type":"message","role":"user","content":"Current task"},
+                {"type":"web_search_call","id":"ws_prior","status":"completed",
+                    "action":{"type":"search","query":"fixture"}}
+            ]
+        });
+        let thread_id = format!("official-cache-{local}-{search}");
+        let headers = ProxySessionHeaders { thread_id: Some(&thread_id), ..Default::default() };
+        let mut result = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+            &normal.to_string(), settings.clone(), "/v1/responses", None, headers,
+        ).await.unwrap();
+        assert_eq!(result.status_code, 200);
+        result.read_body().await.unwrap();
+        let mut compact = normal.clone();
+        compact["tools"] = json!([]);
+        compact["tool_choice"] = json!("none");
+        compact["parallel_tool_calls"] = json!(false);
+        compact["client_metadata"] = json!({
+            "x-codex-turn-metadata": json!({
+                "request_kind":"compaction","compaction":{"implementation":"responses"}
+            }).to_string()
+        });
+        compact["input"].as_array_mut().unwrap().push(json!({
+            "type":"message","role":"user","content":[{"type":"input_text",
+                "text":"You are performing a CONTEXT CHECKPOINT COMPACTION."}]
+        }));
+        let mut result = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+            &compact.to_string(), settings, "/v1/responses", None, headers,
+        ).await.unwrap();
+        assert_eq!(result.status_code, 200, "local={local}, search={search}");
+        result.read_body().await.unwrap();
+        let gateway_requests = gateway.await.unwrap();
+        let requests = official_server.await.unwrap();
+        assert_eq!(requests.len(), 2, "no summary retry");
+        assert_eq!(gateway_requests.len(), 2);
+        let mut expected_normal = normal.clone();
+        if search {
+            expected_normal["tools"].as_array_mut().unwrap().push(
+                json!({"type":"web_search","external_web_access":false})
+            );
+        }
+        assert_eq!(requests[0], expected_normal, "ordinary tool requests stay independent");
+        let mut expected = compact;
+        if local {
+            expected["tools"] = normal["tools"].clone();
+        }
+        if search {
+            expected["tools"].as_array_mut().unwrap().push(
+                json!({"type":"web_search","external_web_access":false})
+            );
+        }
+        assert_eq!(gateway_requests[1], expected, "outer proxy controls cached tools and opt-in search");
+        if !expected["tools"].as_array().unwrap().iter().any(|tool| tool["type"] == "web_search") {
+            expected["tools"].as_array_mut().unwrap().push(
+                json!({"type":"web_search","external_web_access":false})
+            );
+        }
+        assert_eq!(requests[1], expected, "official shaping only adds declarations; history and none stay intact");
+    }
+}
+
 /// 官方登录通道只修「没有声明任何工具」的请求；带工具的普通轮次保持原样。
 #[tokio::test]
 async fn aggregate_official_member_leaves_tool_declaring_requests_unchanged() {
@@ -5003,6 +5378,37 @@ async fn aggregate_official_member_leaves_tool_declaring_requests_unchanged() {
     assert_eq!(sent, request, "带工具的请求不应被改写");
 }
 
+/// none 本身不是摘要身份；普通任务和只有摘要前缀的请求都不自动补工具。
+#[tokio::test]
+async fn aggregate_official_member_leaves_non_summary_tool_choice_none_unchanged() {
+    let _lock = settings_path_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let _home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
+    for text in ["Ordinary task", "You are performing a CONTEXT CHECKPOINT COMPACTION."] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _base = EnvVarGuard::set(
+            "CODEX_PLUS_OFFICIAL_BASE_URL", &format!("http://{address}/backend-api/codex"),
+        );
+        let server = tokio::spawn(capture_json_request_once(listener));
+        let request = json!({
+            "model":"gpt-6.1-sol","stream":false,"tool_choice":"none",
+            "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+            "input":[
+                {"type":"web_search_call","id":"ws_prior","status":"completed"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":text}]}
+            ]
+        });
+        let mut result = open_responses_proxy_request_with_settings(
+            &request.to_string(), official_aggregate_test_settings("official-none", "official-none-agg"),
+        ).await.unwrap();
+        assert_eq!(result.status_code, 200);
+        result.read_body().await.unwrap();
+        assert_eq!(server.await.unwrap().1, request);
+    }
+}
+
 /// 官方登录 token 被提前撤销：第一次 401 后强制刷新一次并原样重试，
 /// 第二次请求带刷新后的 Bearer；refresh 请求带轮换前的 refresh token。
 #[tokio::test]
@@ -5010,6 +5416,7 @@ async fn aggregate_official_member_refreshes_and_retries_after_401() {
     let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let _codex_home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
 
     let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -5108,6 +5515,9 @@ async fn aggregate_official_member_refreshes_and_retries_after_401() {
         ..BackendSettings::default()
     };
 
+    let store = codex_plus_core::settings::SettingsStore::default();
+    store.save(&settings).unwrap();
+
     let result = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5.6-sol","input":"hi","stream":false}"#,
         settings,
@@ -5140,6 +5550,18 @@ async fn aggregate_official_member_refreshes_and_retries_after_401() {
         token_request.contains("refresh_token=official-refresh"),
         "{token_request}"
     );
+
+    let persisted = store
+        .load()
+        .unwrap()
+        .relay_profiles
+        .into_iter()
+        .find(|profile| profile.id == "proxy-official-401")
+        .unwrap();
+    let auth: serde_json::Value = serde_json::from_str(&persisted.auth_contents).unwrap();
+    assert_eq!(auth["tokens"]["access_token"], "refreshed-access");
+    assert_eq!(auth["tokens"]["refresh_token"], "refreshed-refresh");
+    assert_eq!(auth["tokens"]["account_id"], "acct-official");
 }
 
 #[tokio::test]

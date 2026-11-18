@@ -73,6 +73,10 @@ pub trait BridgeSettingsService: Send + Sync {
     async fn get_settings(&self) -> anyhow::Result<BackendSettings>;
     async fn set_settings(&self, payload: Value) -> anyhow::Result<BackendSettings>;
 
+    fn codex_home_dir(&self) -> PathBuf {
+        crate::relay_config::default_codex_home_dir()
+    }
+
     async fn codex_app_version(&self) -> anyhow::Result<String> {
         Ok(String::new())
     }
@@ -191,6 +195,10 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn script_market_install(&self, _payload: Value) -> anyhow::Result<Value> {
         anyhow::bail!("script market is unavailable")
     }
+    /// 精选 / 官方拓展包的安装步骤（prepare / install / discard）。
+    async fn script_market_package(&self, _action: &str, _payload: Value) -> anyhow::Result<Value> {
+        anyhow::bail!("script market is unavailable")
+    }
     /// 独立插件市场只读取索引，安装时才获取目标插件。
     async fn plugin_market_list(&self, payload: Value) -> anyhow::Result<Value> {
         crate::plugin_market::list_plugins(
@@ -293,6 +301,9 @@ pub trait BridgeDataService: Send + Sync {
     async fn recover_remote_control_session(&self, _thread_id: String) -> anyhow::Result<Value> {
         anyhow::bail!("Remote Control session recovery is unavailable")
     }
+    async fn prepare_thread_provider(&self, _request: Value) -> anyhow::Result<Value> {
+        Ok(json!({"status": "unavailable", "changed": false, "message": "Thread provider preparation is unavailable"}))
+    }
 }
 
 /// 拓展脚本在独立 Codex 页面（例如宠物 overlay）执行表达式。
@@ -346,6 +357,32 @@ pub async fn evaluate_extension_cdp(debug_port: u16, payload: &Value) -> anyhow:
     Ok(json!({ "status": "ok", "results": results }))
 }
 
+/// 宿主路由返回的 future。
+pub type HostRouteFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send>>;
+/// 宿主（管理器进程）登记的桥接路由处理函数，入参是页面传来的整份 payload。
+pub type HostRouteHandler = Arc<dyn Fn(Value) -> HostRouteFuture + Send + Sync>;
+
+/// 宿主登记的桥接路由。实现依赖管理器里的状态（Skills、托管 MCP 事务、gh 发布），core 拿不到，
+/// 只负责分发：管理器启动时登记，桥接收到同名路径就交给它；没登记（独立 helper、测试）时按未知路径处理。
+static HOST_ROUTES: std::sync::RwLock<std::collections::BTreeMap<String, HostRouteHandler>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// 登记（或替换）一条宿主路由。
+pub fn register_host_route(path: &str, handler: HostRouteHandler) {
+    HOST_ROUTES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_string(), handler);
+}
+
+fn host_route(path: &str) -> Option<HostRouteHandler> {
+    HOST_ROUTES
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .cloned()
+}
+
 pub async fn handle_bridge_request(
     ctx: BridgeContext,
     path: &str,
@@ -364,6 +401,19 @@ pub async fn handle_bridge_request(
     );
     let result = match path {
         "/settings/get" => settings_value(&ctx, ctx.settings.get_settings().await).await,
+        "/gateway/connection-generation" => match ctx.settings.get_settings().await {
+            Ok(settings) => {
+                let active = settings.relay_profiles_enabled
+                    && settings.active_relay_id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID;
+                if active {
+                    crate::gateway::connection_generation::read(&ctx.settings.codex_home_dir())
+                        .map(|generation| json!({ "status": "ok", "active": true, "generation": generation }))
+                } else {
+                    Ok(json!({ "status": "ok", "active": false, "generation": "" }))
+                }
+            }
+            Err(error) => Err(error),
+        },
         "/dictation/status" => ctx.settings.get_settings().await.map(|settings| {
             let effective = crate::dictation::effective_settings(&settings);
             let mut status = crate::dictation::public_status(&effective);
@@ -384,6 +434,28 @@ pub async fn handle_bridge_request(
         "/dictation/cancel" => {
             crate::dictation::cancel_bridge(&payload).map_err(anyhow::Error::from)
         }
+        // Codex 设置页「语音输入」一节（46-service-settings.js）。都不在拓展路由白名单里。
+        // 本地模型状态只读缓存与下载任务，不触发下载。
+        "/dictation/local-model/status" => Ok(crate::dictation::local_model_status()),
+        // 下载约 229 MiB，桥接请求等不了这么久：放到后台跑，页面轮询上面的状态看进度。
+        "/dictation/local-model/download" => Ok(start_local_dictation_model_download()),
+        "/dictation/global-hotkey" => {
+            serde_json::to_value(crate::global_dictation::load_config()).map_err(anyhow::Error::from)
+        }
+        "/dictation/global-hotkey/set" => global_dictation_hotkey_set_value(&payload),
+        // Codex 设置页「原生 Edge / Chrome 请求标识兼容」下面的只读状态（以前在管理器里）。
+        // 补丁状态要读文件，放到阻塞线程池；连接检测本身是异步的。
+        "/native-browser/status" => {
+            let compatibility =
+                tokio::task::spawn_blocking(crate::native_browser::read_status)
+                    .await
+                    .unwrap_or_else(|_| crate::native_browser::BrowserStatus {
+                        state: "unavailable".into(),
+                        detail: String::new(),
+                    });
+            let connection = crate::native_browser_connection::check_connection().await;
+            Ok(json!({ "compatibility": compatibility, "connection": connection }))
+        }
         "/settings/set" => {
             let result = ctx.settings.set_settings(payload.clone()).await;
             if let Ok(settings) = &result
@@ -399,6 +471,84 @@ pub async fn handle_bridge_request(
         }
         // 只读：设置项清单（标题、说明、分组等），注入页据此生成设置行。
         "/settings/catalog" => crate::settings_catalog::enhancement_settings_catalog(),
+        // 只读：Codex 自定义 prompt（<CODEX_HOME>/prompts/*.md），给「prompt 参数展开」发送前展开占位符。
+        "/custom-prompts/list" => Ok(json!({
+            "status": "ok",
+            "prompts": crate::custom_prompts::list_custom_prompts(&crate::codex_home::default_codex_home_dir()),
+        })),
+        // Codex++ 设置页「Hooks 编辑器」（96-hooks-editor.js）。不在拓展路由白名单里：能写 hooks.json、能执行命令。
+        "/hooks/files" => {
+            let payload = payload.clone();
+            let home = crate::codex_home::default_codex_home_dir();
+            tokio::task::spawn_blocking(move || crate::hooks_editor::list_files(&home, &payload))
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "/hooks/file/write" => {
+            let payload = payload.clone();
+            let home = crate::codex_home::default_codex_home_dir();
+            tokio::task::spawn_blocking(move || crate::hooks_editor::write_file(&home, &payload))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+        }
+        "/hooks/test-run" => {
+            crate::hooks_editor::test_run(&crate::codex_home::default_codex_home_dir(), &payload).await
+        }
+        // Codex++ 设置页「上下文与压缩」（96-context-tuning.js）：把压缩 / 精简系统提示等键同步进通用配置。
+        // 不在拓展路由白名单里：会改 Codex++ 设置。
+        "/session-tuning/read" => tokio::task::spawn_blocking(|| {
+            crate::session_tuning::read(&crate::settings::SettingsStore::default())
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result),
+        "/session-tuning/write" => {
+            let payload = payload.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::session_tuning::write(&crate::settings::SettingsStore::default(), &payload)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+        }
+        // Codex 页面里的「供应商」页（43-provider-page.js）。不在拓展路由白名单里：会改供应商、带 Key。
+        "/providers/list" => crate::provider_page::route_list(),
+        // 保存 / 切换走管理器的同步命令（文件锁、live 文件读写），放到阻塞线程池里跑。
+        "/providers/commit" => {
+            let payload = payload.clone();
+            tokio::task::spawn_blocking(move || crate::provider_page::route_commit(&payload))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+        }
+        // 网关供应商池：分发到管理器的网关命令（同步命令里有文件锁、可能联网），放到阻塞线程池。
+        "/providers/gateway" => {
+            let payload = payload.clone();
+            tokio::task::spawn_blocking(move || crate::provider_page::route_gateway(&payload))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+        }
+        // Codex 页面里的「远程控制」页（46-remote-control-page.js）。不在拓展路由白名单里：能开关服务、管理设备。
+        // 启停要等监听线程就绪，放到阻塞线程池里跑。
+        "/remote-control" => {
+            let payload = payload.clone();
+            tokio::task::spawn_blocking(move || crate::remote_control::bridge_route(&payload))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+        }
+        // Codex 页面里的「任务面板」（47-task-board-page.js）。不在拓展路由白名单里：能新建、改、删任务文件。
+        "/task-board" => {
+            let payload = payload.clone();
+            tokio::task::spawn_blocking(move || crate::task_board::bridge_route(&payload))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+        }
+        "/providers/test" => crate::provider_page::route_test(&payload).await,
+        "/providers/models" => crate::provider_page::route_models(&payload).await,
         // 开放给拓展的设置只读子集：当前供应商的名称、模式、模型与上下文窗口。整份设置（/settings/get）仍不开放。
         "/settings/public" => match ctx.settings.get_settings().await {
             Ok(settings) => {
@@ -466,7 +616,12 @@ pub async fn handle_bridge_request(
             }
         }
         "/user-scripts/load" => ctx.runtime.load_user_scripts().await,
-        "/user-scripts/reload" => ctx.runtime.reload_user_scripts().await,
+        "/user-scripts/reload" => match ctx.runtime.reload_user_scripts().await {
+            Err(error) if error.is::<crate::user_scripts::ReloadOutcomeUnknown>() => {
+                Ok(json!({ "status": "unknown", "message": error.to_string() }))
+            }
+            result => result,
+        },
         "/cdp/targets" => ctx.runtime.cdp_targets().await,
         "/cdp/evaluate" => ctx.runtime.cdp_evaluate(payload.clone()).await,
         // 系统鼠标位置：拓展写「桌宠跟随鼠标」这类功能用（页面里拿不到窗口外的鼠标）。只读。
@@ -502,6 +657,7 @@ pub async fn handle_bridge_request(
         "/backend/status" => backend_status_value(
             ctx.runtime.backend_status().await,
             ctx.settings.get_settings().await,
+            &ctx.settings.codex_home_dir(),
         ),
         "/codex-model-catalog" | "/codex-config-model" => ctx.runtime.codex_model_catalog().await,
         // 开放给拓展的模型目录：只给模型列表与每模型元数据（含上下文窗口），去掉来源地址、config 路径。
@@ -511,6 +667,10 @@ pub async fn handle_bridge_request(
         "/ads" => ctx.runtime.ads().await,
         "/script-market/list" => ctx.runtime.script_market_list().await,
         "/script-market/install" => ctx.runtime.script_market_install(payload.clone()).await,
+        // 精选 / 官方拓展包：prepare（下载校验、返回权限）→ install（用户确认后放进拓展目录）/ discard。
+        "/script-market/package/prepare" => ctx.runtime.script_market_package("prepare", payload.clone()).await,
+        "/script-market/package/install" => ctx.runtime.script_market_package("install", payload.clone()).await,
+        "/script-market/package/discard" => ctx.runtime.script_market_package("discard", payload.clone()).await,
         "/plugin-market/list" => ctx.runtime.plugin_market_list(payload.clone()).await,
         "/plugin-market/install" => ctx.runtime.plugin_market_install(payload.clone()).await,
         "/plugin-market/install-status" => {
@@ -678,6 +838,15 @@ pub async fn handle_bridge_request(
                 .to_string();
             ctx.data.recover_remote_control_session(thread_id).await
         }
+        "/thread-provider/prepare" => {
+            if payload.get("host_id").and_then(Value::as_str) != Some("local")
+                || !payload.get("hostId").is_none_or(|host| host.as_str() == Some("local"))
+            {
+                Err(anyhow::anyhow!("Thread provider preparation is local-only"))
+            } else {
+                ctx.data.prepare_thread_provider(payload.clone()).await
+            }
+        }
         "/thread-resume-model-metadata" => {
             let request = payload.clone();
             tokio::task::spawn_blocking(move || {
@@ -750,6 +919,10 @@ pub async fn handle_bridge_request(
                 })),
             }
         }
+        _ if host_route(path).is_some() => match host_route(path) {
+            Some(handler) => handler(payload.clone()).await,
+            None => Err(anyhow::anyhow!("宿主路由 {path} 已撤销")),
+        },
         _ => {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "bridge.unknown_path",
@@ -964,6 +1137,13 @@ impl BridgeRuntimeService for CoreRuntimeService {
         crate::script_market::install_market_script_by_id(user_scripts, id).await
     }
 
+    async fn script_market_package(&self, action: &str, payload: Value) -> anyhow::Result<Value> {
+        let Some(user_scripts) = &self.user_scripts else {
+            anyhow::bail!("用户脚本目录不可用");
+        };
+        crate::script_market::market_package_request(user_scripts, action, &payload).await
+    }
+
     async fn reload_user_scripts(&self) -> anyhow::Result<Value> {
         if let (Some(user_scripts), Some(websocket_url), Some(evaluator)) = (
             &self.user_scripts,
@@ -1126,6 +1306,7 @@ impl BridgeDataService for UnavailableDataService {
 fn settings_payload_value(
     mut settings: BackendSettings,
     codex_app_version: String,
+    is_multi_instance: bool,
 ) -> anyhow::Result<Value> {
     let managed_session_connection = managed_session_connection(&settings);
     let active_relay_session_provider = settings.active_relay_session_provider();
@@ -1138,6 +1319,7 @@ fn settings_payload_value(
     // 页面心跳比较这两项，发拓展事件 relayProfile/switched、modelCatalog/changed（见 40-backend-settings.js）。
     let active_relay_profile_public = public_active_relay_profile(&settings);
     let catalog_fingerprint = model_catalog_fingerprint(&settings);
+    let catalog_source_identity = model_catalog_source_identity(&settings);
     let mut value = serde_json::to_value(settings)?;
     fn remove_named_keys(value: &mut Value) {
         match value {
@@ -1161,7 +1343,15 @@ fn settings_payload_value(
             "weixinDesktopSync".to_string(),
             serde_json::to_value(crate::connect::desktop_sync::pending())?,
         );
-        object.remove("codexAppStepwiseApiKey");
+        // Key 本身不回给页面，只告诉它「已配置」，设置页据此显示「已配置（留空不改）」。
+        let stepwise_key_configured = object
+            .remove("codexAppStepwiseApiKey")
+            .and_then(|value| value.as_str().map(|value| !value.trim().is_empty()))
+            .unwrap_or(false);
+        object.insert(
+            "codexAppStepwiseApiKeyConfigured".to_string(),
+            json!(stepwise_key_configured),
+        );
         if let Some(dictation) = object.get_mut("dictation").and_then(Value::as_object_mut) {
             let configured = dictation
                 .remove("apiKey")
@@ -1187,6 +1377,8 @@ fn settings_payload_value(
         );
         object.insert("activeRelayProfilePublic".to_string(), active_relay_profile_public);
         object.insert("modelCatalogFingerprint".to_string(), Value::String(catalog_fingerprint));
+        object.insert("modelCatalogSourceIdentity".to_string(), Value::String(catalog_source_identity));
+        object.insert("codexMultiInstance".to_string(), Value::Bool(is_multi_instance));
         object.insert(
             "nativeFastLocalApiConfigured".to_string(),
             Value::Bool(native_fast.native_fast_local_api_configured),
@@ -1221,26 +1413,80 @@ fn public_active_relay_profile(settings: &BackendSettings) -> Value {
 fn model_catalog_fingerprint(settings: &BackendSettings) -> String {
     use std::hash::{Hash, Hasher};
     let profile = settings.active_relay_profile();
-    let aggregate = settings
-        .active_aggregate_relay_profile()
-        .and_then(|aggregate| serde_json::to_string(&aggregate).ok())
-        .unwrap_or_default();
+    let aggregate = settings.active_aggregate_relay_profile();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (
-        settings.relay_profiles_enabled,
-        profile.id.as_str(),
-        profile.name.as_str(),
-        crate::relay_config::relay_profile_model(&profile),
-        profile.model_list.as_str(),
-        profile.model_windows.as_str(),
-        profile.model_auto_compact.as_str(),
-        profile.model_metadata.as_str(),
-        profile.context_window.as_str(),
-        profile.auto_compact_limit.as_str(),
-        aggregate,
-    )
+    let hash_profile = |profile: &crate::settings::RelayProfile,
+                        hasher: &mut std::collections::hash_map::DefaultHasher| {
+        (
+            profile.id.as_str(),
+            profile.name.as_str(),
+            profile.model.as_str(),
+            crate::relay_config::relay_profile_model(profile),
+            profile.model_list.as_str(),
+            profile.model_windows.as_str(),
+            profile.model_auto_compact.as_str(),
+            profile.model_metadata.as_str(),
+            profile.context_window.as_str(),
+            profile.auto_compact_limit.as_str(),
+            crate::official_login::is_official_login_profile(profile),
+            crate::relay_config::upstream_rejects_tool_search(profile),
+        )
+            .hash(&mut *hasher);
+        crate::relay_rotation::member_relay_ready(profile).hash(hasher);
+    };
+    settings.relay_profiles_enabled.hash(&mut hasher);
+    hash_profile(&profile, &mut hasher);
+    if profile.id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID {
+        crate::model_catalog::gateway_catalog_revision(&crate::codex_home::default_codex_home_dir())
+            .hash(&mut hasher);
+    }
+    aggregate
+        .as_ref()
+        .and_then(|value| serde_json::to_string(value).ok())
         .hash(&mut hasher);
+    if let Some(aggregate) = aggregate {
+        for member in &aggregate.members {
+            member.relay_id.hash(&mut hasher);
+            let member_profile = settings
+                .relay_profiles
+                .iter()
+                .find(|profile| profile.id == member.relay_id);
+            member_profile.is_some().hash(&mut hasher);
+            if let Some(member_profile) = member_profile {
+                hash_profile(member_profile, &mut hasher);
+            }
+        }
+    }
     format!("{:016x}", hasher.finish())
+}
+
+/// 只供内部载荷比较连接来源，不向第三方拓展暴露。
+fn model_catalog_source_identity(settings: &BackendSettings) -> String {
+    use sha2::{Digest, Sha256};
+
+    let profile = settings.active_relay_profile();
+    let base_url = crate::relay_config::relay_profile_base_url(&profile);
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-plus-model-catalog-source-v1\0");
+    for value in [
+        profile.id.as_str(),
+        base_url.as_str(),
+        match profile.protocol {
+            crate::settings::RelayProtocol::Responses => "responses",
+            crate::settings::RelayProtocol::ChatCompletions => "chatCompletions",
+            crate::settings::RelayProtocol::AnthropicMessages => "anthropicMessages",
+        },
+        match profile.relay_mode {
+            crate::settings::RelayMode::Official => "official",
+            crate::settings::RelayMode::MixedApi => "mixedApi",
+            crate::settings::RelayMode::PureApi => "pureApi",
+            crate::settings::RelayMode::Aggregate => "aggregate",
+        },
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// `/settings/public`：拓展可读的设置子集。
@@ -1363,10 +1609,32 @@ mod dictation_privacy_tests {
     fn dictation_settings_bridge_removes_asr_key() {
         let mut settings = BackendSettings::default();
         settings.dictation.api_key = "fake-asr-private-key".to_string();
-        let result = settings_payload_value(settings, String::new()).unwrap();
+        let result = settings_payload_value(settings, String::new(), false).unwrap();
         assert!(result["dictation"].get("apiKey").is_none());
         assert_eq!(result["dictation"]["apiKeyConfigured"], true);
         assert!(!result.to_string().contains("fake-asr-private-key"));
+    }
+
+    #[test]
+    fn stepwise_settings_bridge_reports_key_configured_without_the_key() {
+        // Codex 设置页的「下一步建议服务」只拿到「已配置」，Key 本身不回页面。
+        let mut settings = BackendSettings::default();
+        settings.codex_app_stepwise_api_key = "fake-stepwise-private-key".to_string();
+        let result = settings_payload_value(settings, String::new(), false).unwrap();
+        assert!(result.get("codexAppStepwiseApiKey").is_none());
+        assert_eq!(result["codexAppStepwiseApiKeyConfigured"], true);
+        assert!(!result.to_string().contains("fake-stepwise-private-key"));
+        let empty = settings_payload_value(BackendSettings::default(), String::new(), false).unwrap();
+        assert_eq!(empty["codexAppStepwiseApiKeyConfigured"], false);
+    }
+
+    #[test]
+    fn global_hotkey_route_rejects_invalid_hotkeys_before_reaching_the_manager() {
+        // 热键先在 core 里校验，非法值不会交给管理器去注册。
+        let error = global_dictation_hotkey_set_value(&json!({ "enabled": true, "hotkey": "" }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("更新全局听写热键失败"), "{error}");
     }
 
     #[test]
@@ -1375,17 +1643,55 @@ mod dictation_privacy_tests {
         settings.relay_profiles[0].api_keys = vec![crate::settings::RelayApiKey {
             id: "backup".into(), name: "备用".into(), api_key: "fake-backup-secret".into(),
         }];
-        let result = settings_payload_value(settings, String::new()).unwrap();
+        let result = settings_payload_value(settings, String::new(), false).unwrap();
         assert!(result["relayProfiles"][0].get("apiKeys").is_none());
         assert!(!result.to_string().contains("fake-backup-secret"));
     }
+
+    #[test]
+    fn settings_bridge_reports_multi_instance_without_enabling_relay_switching() {
+        let mut settings = BackendSettings::default();
+        settings.relay_profiles_enabled = false;
+        for is_multi_instance in [false, true] {
+            let result =
+                settings_payload_value(settings.clone(), String::new(), is_multi_instance).unwrap();
+            assert_eq!(result["codexMultiInstance"], is_multi_instance);
+            assert_eq!(result["relayProfilesEnabled"], false);
+            assert!(result["managedSessionConnection"].is_null());
+        }
+    }
+
+    #[test]
+    fn gateway_catalog_change_advances_heartbeat_without_a_settings_save() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("model-catalogs/codex-plus-gateway.json");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "model_catalog_json = 'model-catalogs/codex-plus-gateway.json'\n").unwrap();
+        let mut settings = BackendSettings::default();
+        settings.active_relay_id = crate::gateway::apply::CODEX_GATEWAY_RELAY_ID.into();
+        settings.settings_revision = "worker-snapshot".into();
+        let status = || backend_status_value(Ok(json!({"status":"ok"})), Ok(settings.clone()), home.path()).unwrap();
+        std::fs::write(&path, r#"{"models":[{"slug":"old"}]}"#).unwrap();
+        let before = status();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let modified = metadata.modified().unwrap();
+        assert_eq!(status(), before);
+        std::fs::write(&path, r#"{"models":[{"slug":"new"}]}"#).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+        let updated = std::fs::metadata(&path).unwrap();
+        assert_eq!(updated.modified().unwrap(), modified);
+        assert_eq!(updated.len(), metadata.len());
+        assert_ne!(status()["settingsRevision"], before["settingsRevision"]);
+    }
+
     #[test]
     fn dictation_settings_bridge_applies_enhancement_switch_without_mutating_settings() {
         let mut settings = BackendSettings::default();
         settings.enhancements_enabled = false;
         settings.dictation.enabled = true;
         settings.dictation.api_key = "fake-asr-private-key".to_string();
-        let result = settings_payload_value(settings.clone(), String::new()).unwrap();
+        let result = settings_payload_value(settings.clone(), String::new(), false).unwrap();
         assert_eq!(result["dictation"]["enabled"], false);
         assert_eq!(result["dictation"]["apiKeyConfigured"], true);
         assert!(settings.dictation.enabled);
@@ -1399,12 +1705,17 @@ async fn settings_value(
 ) -> anyhow::Result<Value> {
     let settings = result?;
     let codex_app_version = ctx.settings.codex_app_version().await.unwrap_or_default();
-    settings_payload_value(settings, codex_app_version)
+    settings_payload_value(
+        settings,
+        codex_app_version,
+        std::env::var_os("CODEX_PLUS_MULTI_INSTANCE").as_deref() == Some(std::ffi::OsStr::new("1")),
+    )
 }
 
 fn backend_status_value(
     status: anyhow::Result<Value>,
     settings: anyhow::Result<BackendSettings>,
+    home: &std::path::Path,
 ) -> anyhow::Result<Value> {
     let mut status = status?;
     if let Some(object) = status.as_object_mut() {
@@ -1418,7 +1729,15 @@ fn backend_status_value(
         // /settings/get（166 KB 的 JSON，编解码开销全落在渲染进程主线程上）。
         let revision = settings
             .as_ref()
-            .map(|settings| settings.settings_revision.clone())
+            .map(|settings| {
+                // 多开实例的设置独立保存，但 Agent 发布的网关目录仍可更新。
+                if settings.active_relay_id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID
+                    && let Some(catalog_revision) = crate::model_catalog::gateway_catalog_revision(home)
+                {
+                    return format!("{}:{catalog_revision:016x}", settings.settings_revision);
+                }
+                settings.settings_revision.clone()
+            })
             .unwrap_or_default();
         object.insert("settingsRevision".to_string(), Value::from(revision));
     }
@@ -1430,6 +1749,44 @@ where
     T: serde::Serialize,
 {
     Ok(serde_json::to_value(result?)?)
+}
+
+/// 在后台开始下载本地 SenseVoice 模型，立即返回当前状态（phase 记为 downloading）。
+/// 结果（ready / failed 与原因）写进 `local_model_status()`，由页面轮询读取；
+/// 已经在下载时后台那次会因为拿不到锁直接返回，不影响正在进行的下载。
+fn start_local_dictation_model_download() -> Value {
+    tokio::spawn(async {
+        let _ = crate::dictation::prepare_local_model().await;
+    });
+    let mut status = crate::dictation::local_model_status();
+    if status["phase"].as_str() != Some("downloading") {
+        status["phase"] = json!("downloading");
+        status["completedBytes"] = json!(0);
+        if let Some(object) = status.as_object_mut() {
+            object.remove("message");
+        }
+    }
+    status["status"] = json!("ok");
+    status
+}
+
+/// Codex 设置页保存全局听写热键：校验后交给管理器保存并重新注册。
+fn global_dictation_hotkey_set_value(payload: &Value) -> anyhow::Result<Value> {
+    let config = crate::global_dictation::GlobalDictationConfig {
+        enabled: payload.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+        hotkey: payload
+            .get("hotkey")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    };
+    crate::global_dictation::apply_config(&config)
+        .map_err(|error| anyhow::anyhow!("更新全局听写热键失败：{error:#}"))?;
+    let mut value = serde_json::to_value(&config)?;
+    value["status"] = json!("ok");
+    value["message"] = json!(if config.enabled { "全局听写热键已开启。" } else { "全局听写热键已关闭。" });
+    Ok(value)
 }
 
 fn stepwise_settings_value(result: anyhow::Result<BackendSettings>) -> anyhow::Result<Value> {
@@ -1727,6 +2084,41 @@ fn empty_user_script_inventory() -> Value {
         "enabled": true,
         "scripts": []
     })
+}
+
+#[cfg(test)]
+mod thread_provider_prepare_route_tests {
+    use super::*;
+
+    fn context() -> BridgeContext {
+        BridgeContext::core(Arc::new(CoreRuntimeService::new(
+            0,
+            StatusStore::new(PathBuf::from("unused-thread-provider-status.json")),
+        )))
+    }
+
+    #[tokio::test]
+    async fn thread_provider_prepare_route_defaults_to_explicit_unavailable() {
+        let response = handle_bridge_request(context(), "/thread-provider/prepare", json!({
+            "host_id": "local", "thread_id": "thread-1",
+            "source_provider": "openai", "target_provider": "custom",
+        })).await;
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["changed"], false);
+    }
+
+    #[tokio::test]
+    async fn thread_provider_prepare_route_rejects_unknown_or_conflicting_hosts() {
+        for payload in [
+            json!({}),
+            json!({"host_id": "ssh"}),
+            json!({"host_id": "local", "hostId": "ssh"}),
+        ] {
+            let response = handle_bridge_request(context(), "/thread-provider/prepare", payload).await;
+            assert_eq!(response["status"], "failed");
+            assert!(response["message"].as_str().unwrap().contains("local-only"));
+        }
+    }
 }
 
 #[cfg(test)]
